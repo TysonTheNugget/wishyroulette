@@ -8,9 +8,9 @@ const { BIP32Factory } = require('bip32');
 bitcoin.initEccLib(ecc); // Initialize ECC library
 const bip32 = BIP32Factory(ecc);
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000; // Use Render's PORT or default to 3000
 app.use(express.static('public')); // Serve index.html from public folder
-const mnemonic = process.env.MNEMONIC 
+const mnemonic = process.env.MNEMONIC;
 const seed = bip39.mnemonicToSeedSync(mnemonic);
 const root = bip32.fromSeed(seed, bitcoin.networks.bitcoin); // For testnet, use bitcoin.networks.testnet
 const child = root.derivePath("m/84'/0'/0'/0/0");
@@ -298,11 +298,4 @@ app.get('/status', async (req, res) => {
   for (const k in contributors) contribStr[k] = contributors[k].toString();
   res.json({ address, pot, contributors: contribStr, lastWinner });
 });
-if (process.env.VERCEL) {
-  module.exports = app; // serverless export for Vercel
-} else {
-if (process.env.VERCEL) {
-  module.exports = app; // export Express for serverless
-} else {
-  app.listen(port, () => console.log(`Server running on port ${port}`));
-}
+app.listen(port, () => console.log(`Server running on port ${port}`));
