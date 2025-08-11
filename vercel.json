@@ -1,10 +1,15 @@
 {
-  "rewrites": [
-    { "source": "/init", "destination": "/api/index" },
-    { "source": "/poll", "destination": "/api/index" },
-    { "source": "/check", "destination": "/api/index" },
-    { "source": "/status", "destination": "/api/index" },
-    { "source": "/", "destination": "/public/index.html" },
-    { "source": "/(.*\\.(css|js|png|jpg|jpeg|gif|svg|ico))", "destination": "/public/$1" }
+  "routes": [
+    { "src": "/init", "dest": "/api/index" },
+    { "src": "/poll", "dest": "/api/index" },
+    { "src": "/check", "dest": "/api/index" },
+    { "src": "/status", "dest": "/api/index" },
+
+    // Serve files from /public at the root (CSS/JS/images/etc.)
+    { "src": "/(.*\\.(css|js|png|jpg|jpeg|gif|svg|ico))", "dest": "/public/$1" },
+
+    // Serve the app shell
+    { "src": "/", "dest": "/public/index.html" },
+    { "src": "/.*", "dest": "/public/index.html" }
   ]
 }
