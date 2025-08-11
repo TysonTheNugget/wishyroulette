@@ -21,9 +21,23 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle preflight requests for all routes
 
-app.use(express.static('public')); // Serve index.html from public folder
+app.use(express.static('public')); // Serve static files from public folder
+
+// Validate environment variables
+if (!process.env.MNEMONIC) {
+  console.error('Error: MNEMONIC environment variable is not set');
+  process.exit(1);
+}
+
 const mnemonic = process.env.MNEMONIC;
-const seed = bip39.mnemonicToSeedSync(mnemonic);
+let seed;
+try {
+  seed = bip39.mnemonicToSeedSync(mnemonic);
+} catch (e) {
+  console.error(`Error generating seed from MNEMONIC: ${e.message}`);
+  process.exit(1);
+}
+
 const root = bip32.fromSeed(seed, bitcoin.networks.bitcoin); // For testnet, use bitcoin.networks.testnet
 const child = root.derivePath("m/84'/0'/0'/0/0");
 const { address } = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(child.publicKey), network: bitcoin.networks.bitcoin }); // For testnet, use bitcoin.networks.testnet
