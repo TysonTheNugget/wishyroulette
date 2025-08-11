@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
 const fetch = require('node-fetch');
 const bip39 = require('bip39');
 const bitcoin = require('bitcoinjs-lib');
@@ -9,6 +10,17 @@ bitcoin.initEccLib(ecc); // Initialize ECC library
 const bip32 = BIP32Factory(ecc);
 const app = express();
 const port = process.env.PORT || 3000; // Use Render's PORT or default to 3000
+
+// CORS configuration
+const corsOptions = {
+  origin: ['https://ruletfront.vercel.app', 'http://localhost:3000'], // Allow frontend origin and local dev
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // Handle preflight requests for all routes
+
 app.use(express.static('public')); // Serve index.html from public folder
 const mnemonic = process.env.MNEMONIC;
 const seed = bip39.mnemonicToSeedSync(mnemonic);
@@ -25,6 +37,7 @@ let contributors = {}; // { address: BigInt amount }
 let lastTxid = null;
 let currentHeight = 0;
 let lastWinner = null;
+
 async function init() {
   console.log('Initializing rune info...');
   try {
@@ -48,6 +61,7 @@ async function init() {
     return { success: false, error: e.message };
   }
 }
+
 async function pollActivity() {
   console.log(`Polling activity for address: ${address}`);
   try {
@@ -99,6 +113,7 @@ async function pollActivity() {
     return { success: false, error: e.message };
   }
 }
+
 async function getCurrentHeight() {
   console.log('Fetching current block height...');
   try {
@@ -112,6 +127,7 @@ async function getCurrentHeight() {
     return null;
   }
 }
+
 async function checkBlock() {
   console.log('Checking for new block...');
   const height = await getCurrentHeight();
@@ -169,6 +185,7 @@ async function checkBlock() {
   currentHeight = height;
   return { success: true, message: 'No action' };
 }
+
 async function payoutTo(winnerAddress) {
   console.log(`Attempting payout to ${winnerAddress}`);
   if (!runeId || !runeId.includes(':')) {
@@ -264,6 +281,7 @@ async function payoutTo(winnerAddress) {
     return false;
   }
 }
+
 function encodeVarint(n) {
   const bytes = [];
   if (n === 0n) return Buffer.from([0]);
@@ -275,6 +293,7 @@ function encodeVarint(n) {
   }
   return Buffer.from(bytes);
 }
+
 app.get('/init', async (req, res) => {
   const result = await init();
   if (result.success) {
@@ -283,14 +302,17 @@ app.get('/init', async (req, res) => {
     res.json(result);
   }
 });
+
 app.get('/poll', async (req, res) => {
   const result = await pollActivity();
   res.json(result);
 });
+
 app.get('/check', async (req, res) => {
   const result = await checkBlock();
   res.json(result);
 });
+
 app.get('/status', async (req, res) => {
   const potRaw = Object.values(contributors).reduce((a, b) => a + b, 0n);
   const pot = (potRaw / (10n ** BigInt(decimals || 0))).toString();
@@ -298,4 +320,5 @@ app.get('/status', async (req, res) => {
   for (const k in contributors) contribStr[k] = contributors[k].toString();
   res.json({ address, pot, contributors: contribStr, lastWinner });
 });
+
 app.listen(port, () => console.log(`Server running on port ${port}`));
