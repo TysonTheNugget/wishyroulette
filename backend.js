@@ -301,5 +301,8 @@ app.get('/status', async (req, res) => {
 if (process.env.VERCEL) {
   module.exports = app; // serverless export for Vercel
 } else {
+if (process.env.VERCEL) {
+  module.exports = app; // export Express for serverless
+} else {
   app.listen(port, () => console.log(`Server running on port ${port}`));
 }
