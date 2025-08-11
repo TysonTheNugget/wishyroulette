@@ -1,0 +1,10 @@
+{
+  "rewrites": [
+    { "source": "/init", "destination": "/api/index" },
+    { "source": "/poll", "destination": "/api/index" },
+    { "source": "/check", "destination": "/api/index" },
+    { "source": "/status", "destination": "/api/index" },
+    { "source": "/", "destination": "/public/index.html" },
+    { "source": "/(.*\\.(css|js|png|jpg|jpeg|gif|svg|ico))", "destination": "/public/$1" }
+  ]
+}

@@ -1,0 +1,72 @@
+<!-- public/index.html - Frontend -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Wishy Washy Rune Lottery</title>
+</head>
+<body>
+  <h1>Wishy Washy Rune Lottery</h1>
+  <p>Send WISHYWASHYRUNE Runes to: <span id="addr"></span></p>
+  <p>Current Pot: <span id="pot"></span> WISHY</p>
+  <p>Last Winner: <span id="winner"></span></p>
+  
+  <h2>Manual Controls</h2>
+  <button onclick="trigger('init')">Init Rune Info</button>
+  <button onclick="trigger('poll')">Poll for Deposits</button>
+  <button onclick="trigger('check')">Check Block / Lottery</button>
+  <button onclick="trigger('status')">Refresh Status</button>
+  
+  <h2>Logs</h2>
+  <div id="logs" style="border:1px solid #ccc; padding:10px; height:300px; overflow-y:scroll;"></div>
+  
+  <script>
+    function log(message) {
+      const logsDiv = document.getElementById('logs');
+      const entry = document.createElement('p');
+      entry.innerText = new Date().toLocaleString() + ': ' + message;
+      logsDiv.appendChild(entry);
+      logsDiv.scrollTop = logsDiv.scrollHeight;
+    }
+
+    async function trigger(endpoint) {
+      log(`Triggering /${endpoint}...`);
+      try {
+        const res = await fetch(`/${endpoint}`);
+        if (!res.ok) {
+          log(`Error: HTTP ${res.status}`);
+          return;
+        }
+        const data = await res.json();
+        if (data.success === false) {
+          log(`Failed: ${data.error || 'Unknown error'}`);
+        } else {
+          log(`Success: ${JSON.stringify(data, null, 2)}`);
+        }
+        if (endpoint === 'status') updateStatus(data);
+      } catch (e) {
+        log(`Exception: ${e.message}`);
+      }
+    }
+
+    function updateStatus(data) {
+      document.getElementById('addr').innerText = data.address || 'Not set';
+      document.getElementById('pot').innerText = data.pot || '0';
+      document.getElementById('winner').innerText = data.lastWinner || 'None yet';
+    }
+
+    async function autoUpdate() {
+      try {
+        const res = await fetch('/status');
+        const data = await res.json();
+        updateStatus(data);
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    setInterval(autoUpdate, 10000);
+    autoUpdate();
+  </script>
+</body>
+</html>
