@@ -9,17 +9,17 @@ const { BIP32Factory } = require('bip32');
 bitcoin.initEccLib(ecc); // Initialize ECC library
 const bip32 = BIP32Factory(ecc);
 const app = express();
-const port = process.env.PORT || 3000; // Use Render's PORT or default to 3000
+const port = process.env.PORT || 3000;
 
 // CORS configuration
 const corsOptions = {
-  origin: ['https://ruletfront.vercel.app', 'http://localhost:3000'], // Allow frontend origin and local dev
+  origin: ['https://ruletfront.vercel.app', 'http://localhost:3000'],
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 };
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // Handle preflight requests for all routes
+app.options('*', cors(corsOptions));
 
 // Validate environment variables
 if (!process.env.MNEMONIC) {
@@ -38,14 +38,14 @@ try {
 
 const root = bip32.fromSeed(seed, bitcoin.networks.bitcoin); // For testnet, use bitcoin.networks.testnet
 const child = root.derivePath("m/84'/0'/0'/0/0");
-const { address } = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(child.publicKey), network: bitcoin.networks.bitcoin }); // For testnet, use bitcoin.networks.testnet
+const { address } = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(child.publicKey), network: bitcoin.networks.bitcoin });
 const apiKey = '373a1e27-947f-4bd8-80c6-639a03014a16';
 const baseUrl = 'https://api.ordiscan.com/v1';
 const headers = { 'Authorization': `Bearer ${apiKey}` };
 const runeName = 'WISHYWASHYMACHINE';
-let runeId = process.env.RUNE_ID || "865286:2249"; // WISHYWASHYMACHINE
+let runeId = process.env.RUNE_ID || "865286:2249";
 let decimals = Number(process.env.RUNE_DECIMALS ?? 0);
-let contributors = {}; // { address: BigInt amount }
+let contributors = {};
 let lastTxid = null;
 let currentHeight = 0;
 let lastWinner = null;
@@ -86,27 +86,27 @@ async function pollActivity() {
     const data = response.data || [];
     let newContributions = 0;
     let newWithdrawals = 0;
+    let totalPotAdjustment = 0n;
+
     for (const tx of data) {
       if (lastTxid && tx.txid === lastTxid) break;
       let incomingAmount = 0n;
       let outgoingAmount = 0n;
       let sender = null;
-      let recipient = null;
 
-      // Check for incoming runes (to our address)
+      // Check for incoming runes
       for (const out of tx.outputs) {
         if (out.address === address && out.rune === runeName) {
           incomingAmount += BigInt(out.rune_amount);
         }
       }
 
-      // Check for outgoing runes (from our address)
+      // Check for outgoing runes
       const isFromOurAddress = tx.inputs.some(inp => inp.address === address && inp.rune === runeName);
       if (isFromOurAddress) {
         for (const out of tx.outputs) {
           if (out.rune === runeName && out.address !== address) {
             outgoingAmount += BigInt(out.rune_amount);
-            recipient = out.address;
           }
         }
       }
@@ -130,22 +130,50 @@ async function pollActivity() {
         }
       }
 
-      if (outgoingAmount > 0n && recipient) {
-        // Deduct from contributors if the recipient was a contributor
-        if (contributors[recipient]) {
-          contributors[recipient] = contributors[recipient] >= outgoingAmount ? contributors[recipient] - outgoingAmount : 0n;
-          if (contributors[recipient] === 0n) delete contributors[recipient];
-          newWithdrawals++;
-          console.log(`Deducted ${outgoingAmount.toString()} from ${recipient} due to outgoing transfer`);
+      if (outgoingAmount > 0n) {
+        totalPotAdjustment -= outgoingAmount;
+        newWithdrawals++;
+        console.log(`Detected outgoing transfer of ${outgoingAmount.toString()} WISHYWASHYMACHINE`);
+      }
+    }
+
+    // Adjust contributors based on outgoing transfers
+    if (totalPotAdjustment < 0n) {
+      let totalPot = Object.values(contributors).reduce((a, b) => a + b, 0n);
+      totalPot += totalPotAdjustment;
+      if (totalPot <= 0n) {
+        contributors = {};
+      } else {
+        // Proportionally reduce contributor amounts
+        const scale = totalPot / (totalPot - totalPotAdjustment);
+        for (const sender in contributors) {
+          contributors[sender] = BigInt(Math.floor(Number(contributors[sender]) * Number(scale)));
+          if (contributors[sender] === 0n) delete contributors[sender];
         }
       }
     }
+
     if (data.length > 0) {
       lastTxid = data[0].txid;
       console.log(`Updated lastTxid to ${lastTxid}`);
     }
     const totalPot = Object.values(contributors).reduce((a, b) => a + b, 0n);
     console.log(`Total pot: ${totalPot.toString()} WISHYWASHYMACHINE`);
+
+    // Sync with actual balance
+    const balanceResult = await getBalance();
+    if (balanceResult.success) {
+      const actualBalance = BigInt(balanceResult.balance);
+      const currentPot = Object.values(contributors).reduce((a, b) => a + b, 0n);
+      if (actualBalance !== currentPot) {
+        console.log(`Balance mismatch: contributors pot=${currentPot}, actual=${actualBalance}. Syncing...`);
+        contributors = {};
+        if (actualBalance > 0n) {
+          contributors['unknown'] = actualBalance;
+        }
+      }
+    }
+
     return { success: true, newContributions, newWithdrawals };
   } catch (e) {
     console.error('Poll activity error:', e);
@@ -156,7 +184,7 @@ async function pollActivity() {
 async function getCurrentHeight() {
   console.log('Fetching current block height...');
   try {
-    const res = await fetch('https://mempool.space/api/blocks/tip/height'); // For testnet, use https://mempool.space/testnet/api/...
+    const res = await fetch('https://mempool.space/api/blocks/tip/height');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const height = Number(await res.text());
     console.log(`Current height: ${height}`);
@@ -270,7 +298,7 @@ async function payoutTo(winnerAddress) {
     const fees = await feeRes.json();
     const feeRate = fees.economyFee;
     console.log(`Using fee rate: ${feeRate} sat/vB`);
-    const txSize = 10 + utxos.length * 68 + 34 * 3 + 20; // Rough estimate
+    const txSize = 10 + utxos.length * 68 + 34 * 3 + 20;
     let fee = BigInt(feeRate * txSize);
     const dust = 546n;
     let change = totalSats - dust - fee;
