@@ -85,15 +85,32 @@ async function pollActivity() {
     const response = await res.json();
     const data = response.data || [];
     let newContributions = 0;
+    let newWithdrawals = 0;
     for (const tx of data) {
       if (lastTxid && tx.txid === lastTxid) break;
       let incomingAmount = 0n;
+      let outgoingAmount = 0n;
       let sender = null;
+      let recipient = null;
+
+      // Check for incoming runes (to our address)
       for (const out of tx.outputs) {
         if (out.address === address && out.rune === runeName) {
           incomingAmount += BigInt(out.rune_amount);
         }
       }
+
+      // Check for outgoing runes (from our address)
+      const isFromOurAddress = tx.inputs.some(inp => inp.address === address && inp.rune === runeName);
+      if (isFromOurAddress) {
+        for (const out of tx.outputs) {
+          if (out.rune === runeName && out.address !== address) {
+            outgoingAmount += BigInt(out.rune_amount);
+            recipient = out.address;
+          }
+        }
+      }
+
       if (incomingAmount > 0n) {
         const inputAddresses = new Set(tx.inputs.map(i => i.address));
         if (inputAddresses.size === 1) {
@@ -112,6 +129,16 @@ async function pollActivity() {
           console.log(`New contribution from ${sender}: ${incomingAmount.toString()}`);
         }
       }
+
+      if (outgoingAmount > 0n && recipient) {
+        // Deduct from contributors if the recipient was a contributor
+        if (contributors[recipient]) {
+          contributors[recipient] = contributors[recipient] >= outgoingAmount ? contributors[recipient] - outgoingAmount : 0n;
+          if (contributors[recipient] === 0n) delete contributors[recipient];
+          newWithdrawals++;
+          console.log(`Deducted ${outgoingAmount.toString()} from ${recipient} due to outgoing transfer`);
+        }
+      }
     }
     if (data.length > 0) {
       lastTxid = data[0].txid;
@@ -119,7 +146,7 @@ async function pollActivity() {
     }
     const totalPot = Object.values(contributors).reduce((a, b) => a + b, 0n);
     console.log(`Total pot: ${totalPot.toString()} WISHYWASHYMACHINE`);
-    return { success: true, newContributions };
+    return { success: true, newContributions, newWithdrawals };
   } catch (e) {
     console.error('Poll activity error:', e);
     return { success: false, error: e.message };
@@ -206,7 +233,11 @@ async function payoutTo(winnerAddress) {
   }
   try {
     const utxoRes = await fetch(`${baseUrl}/address/${address}/utxos`, { headers });
-    if (!utxoRes.ok) throw new Error(`UTXO fetch failed: HTTP ${utxoRes.status}`);
+    if (!utxoRes.ok) {
+      const errorText = await utxoRes.text();
+      console.error(`UTXO fetch failed: HTTP ${utxoRes.status}, ${errorText}`);
+      return false;
+    }
     const utxoResponse = await utxoRes.json();
     const utxos = utxoResponse.data || [];
     if (utxos.length === 0) {
@@ -215,14 +246,27 @@ async function payoutTo(winnerAddress) {
     }
     let totalSats = 0n;
     let hasRune = false;
+    let runeAmount = 0n;
     utxos.forEach(u => {
       totalSats += BigInt(u.value);
-      if (u.runes) u.runes.forEach(r => { if (r.name === runeName) hasRune = true; });
+      if (u.runes) u.runes.forEach(r => {
+        if (r.name === runeName) {
+          hasRune = true;
+          runeAmount += BigInt(r.amount);
+        }
+      });
     });
-    console.log(`Total sats: ${totalSats}, Has rune: ${hasRune}`);
-    if (!hasRune) return false;
-    const feeRes = await fetch('https://mempool.space/api/v1/fees/recommended'); // For testnet, use https://mempool.space/testnet/api/...
-    if (!feeRes.ok) throw new Error(`Fee fetch failed: HTTP ${feeRes.status}`);
+    console.log(`Total sats: ${totalSats}, Has rune: ${hasRune}, Rune amount: ${runeAmount.toString()}`);
+    if (!hasRune) {
+      console.log('No runes found in UTXOs');
+      return false;
+    }
+    const feeRes = await fetch('https://mempool.space/api/v1/fees/recommended');
+    if (!feeRes.ok) {
+      const errorText = await feeRes.text();
+      console.error(`Fee fetch failed: HTTP ${feeRes.status}, ${errorText}`);
+      return false;
+    }
     const fees = await feeRes.json();
     const feeRate = fees.economyFee;
     console.log(`Using fee rate: ${feeRate} sat/vB`);
@@ -234,12 +278,12 @@ async function payoutTo(winnerAddress) {
       console.log('Insufficient sats for fee');
       return false;
     }
-    const psbt = new bitcoin.Psbt({ network: bitcoin.networks.bitcoin }); // For testnet, use bitcoin.networks.testnet
+    const psbt = new bitcoin.Psbt({ network: bitcoin.networks.bitcoin });
     const p2wpkh = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(child.publicKey), network: bitcoin.networks.bitcoin });
     for (const u of utxos) {
       if (!u.outpoint) {
         console.error(`Invalid UTXO: ${JSON.stringify(u)}`);
-        continue; // skip bad entry
+        continue;
       }
       const [h, idxStr] = u.outpoint.split(':');
       const script = u.script_pubkey ? Buffer.from(u.script_pubkey, 'hex') : p2wpkh.output;
@@ -250,7 +294,7 @@ async function payoutTo(winnerAddress) {
       });
     }
     psbt.addOutput({ address: winnerAddress, value: Number(dust) });
-    let outputIndex = 0; // Always send runes to output 0 (winner)
+    let outputIndex = 0;
     if (change >= dust) {
       psbt.addOutput({ address: address, value: Number(change) });
     }
@@ -259,7 +303,7 @@ async function payoutTo(winnerAddress) {
     const deltaTx = BigInt(txStr);
     const amount = 0n; // 0 means all
     const payload = Buffer.concat([
-      encodeVarint(0n), // Edicts tag
+      encodeVarint(0n),
       encodeVarint(deltaBlock),
       encodeVarint(deltaTx),
       encodeVarint(amount),
@@ -267,7 +311,6 @@ async function payoutTo(winnerAddress) {
     ]);
     const opReturnScript = bitcoin.script.compile([bitcoin.opcodes.OP_RETURN, bitcoin.opcodes.OP_13, payload]);
     psbt.addOutput({ script: opReturnScript, value: 0 });
-    // Wrap BIP32 signer so it returns Buffer (bitcoinjs expects Buffer)
     const signer = {
       publicKey: Buffer.from(child.publicKey),
       sign: (hash) => Buffer.from(child.sign(hash)),
@@ -279,18 +322,45 @@ async function payoutTo(winnerAddress) {
     const tx = psbt.extractTransaction();
     const txHex = tx.toHex();
     console.log(`Built TX: ${txHex}`);
-    const broadRes = await fetch('https://mempool.space/api/tx', { method: 'POST', body: txHex }); // For testnet, use https://mempool.space/testnet/api/...
+    const broadRes = await fetch('https://mempool.space/api/tx', { method: 'POST', body: txHex });
     if (broadRes.ok) {
       const txid = await broadRes.text();
       console.log(`Broadcast successful: TXID ${txid}`);
       return true;
     } else {
-      console.error(`Broadcast failed: ${await broadRes.text()}`);
+      const errorText = await broadRes.text();
+      console.error(`Broadcast failed: ${errorText}`);
       return false;
     }
   } catch (e) {
-    console.error('Payout error:', e);
+    console.error(`Payout error: ${e.message}`);
     return false;
+  }
+}
+
+async function getBalance() {
+  console.log(`Fetching rune balance for address: ${address}`);
+  try {
+    const res = await fetch(`${baseUrl}/address/${address}/runes`, { headers });
+    if (!res.ok) {
+      const errorText = await res.text();
+      console.error(`Balance fetch failed: HTTP ${res.status}, ${errorText}`);
+      return { success: false, error: errorText };
+    }
+    const response = await res.json();
+    const data = response.data || [];
+    let balance = 0n;
+    for (const rune of data) {
+      if (rune.rune_name === runeName) {
+        balance = BigInt(rune.amount);
+        break;
+      }
+    }
+    console.log(`Current rune balance: ${balance.toString()} WISHYWASHYMACHINE`);
+    return { success: true, balance: balance.toString() };
+  } catch (e) {
+    console.error(`Balance fetch error: ${e.message}`);
+    return { success: false, error: e.message };
   }
 }
 
@@ -331,6 +401,18 @@ app.get('/status', async (req, res) => {
   const contribStr = {};
   for (const k in contributors) contribStr[k] = contributors[k].toString();
   res.json({ address, pot, contributors: contribStr, lastWinner });
+});
+
+app.get('/balance', async (req, res) => {
+  const result = await getBalance();
+  res.json(result);
+});
+
+app.get('/reset', async (req, res) => {
+  contributors = {};
+  lastTxid = null;
+  console.log('Contributors and lastTxid reset manually');
+  res.json({ success: true, message: 'Contributors and lastTxid reset' });
 });
 
 app.listen(port, () => console.log(`Server running on port ${port}`));
