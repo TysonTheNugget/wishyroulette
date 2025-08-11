@@ -21,8 +21,6 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle preflight requests for all routes
 
-app.use(express.static('public')); // Serve static files from public folder
-
 // Validate environment variables
 if (!process.env.MNEMONIC) {
   console.error('Error: MNEMONIC environment variable is not set');
