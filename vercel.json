@@ -1,0 +1,9 @@
+{
+  "routes": [
+    { "src": "/(init|poll|check|status)", "dest": "/api/index/$1" },
+
+    { "src": "/(.*\\.(css|js|png|jpg|jpeg|gif|svg|ico))", "dest": "/public/$1" },
+    { "src": "/", "dest": "/public/index.html" },
+    { "src": "/.*", "dest": "/public/index.html" }
+  ]
+}
