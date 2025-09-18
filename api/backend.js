@@ -169,19 +169,19 @@ async function pollMempool() {
 
 async function pollActivity() {
   console.log(`Polling activity for address: ${address}`);
-  let contributors = await getState('contributors', {});
-  let lastTxid = await getState('lastTxid', null);
-  const pendingResult = await pollMempool();
-  let pendingContributors = await getState('pendingContributors', {});
-  if (pendingResult.success) {
-    for (const contrib of pendingResult.pending) {
-      if (!pendingContributors[contrib.txid]) {
-        pendingContributors[contrib.txid] = contrib;
-      }
-    }
-    await setState('pendingContributors', pendingContributors);
-  }
   try {
+    let contributors = await getState('contributors', {});
+    let lastTxid = await getState('lastTxid', null);
+    const pendingResult = await pollMempool();
+    let pendingContributors = await getState('pendingContributors', {});
+    if (pendingResult.success) {
+      for (const contrib of pendingResult.pending) {
+        if (!pendingContributors[contrib.txid]) {
+          pendingContributors[contrib.txid] = contrib;
+        }
+      }
+      await setState('pendingContributors', pendingContributors);
+    }
     const res = await fetch(`${baseUrl}/address/${address}/activity/runes?sort=newest`, { headers });
     if (!res.ok) {
       console.error(`Poll failed: HTTP ${res.status}`);
@@ -322,68 +322,73 @@ async function getCurrentHeight() {
 
 async function checkBlock() {
   console.log('Checking for new block...');
-  let currentHeight = await getState('currentHeight', 0);
-  let contributors = await getState('contributors', {});
-  let lastWinner = await getState('lastWinner', null);
-  const height = await getCurrentHeight();
-  if (height === null) return { success: false, error: 'Failed to get height' };
-  if (height > currentHeight && currentHeight > 0) {
-    console.log(`New block detected: ${height}. Triggering lottery for previous height ${height - 1}`);
-    const pot = Object.values(contributors).reduce((a, b) => a + BigInt(b), 0n);
-    if (pot > 0n) {
-      console.log(`Pot value: ${pot.toString()}`);
-      const prevHeight = height - 1;
-      let hash;
-      try {
-        const blockRes = await fetch(`${mempoolBase}/block-height/${prevHeight}`);
-        const responseText = await blockRes.text();
-        if (!blockRes.ok) throw new Error(`mempool.space failed: HTTP ${blockRes.status}, ${responseText}`);
-        hash = responseText.trim();
-        console.log(`Using block hash ${hash} for randomness`);
-      } catch (e) {
-        console.error(`mempool.space error: ${e.message}`);
-        return { success: false, error: `Block fetch error: ${e.message}` };
-      }
-      const rand = BigInt(`0x${hash}`) % pot;
-      const entries = Object.entries(contributors).sort((a, b) => a[0].localeCompare(b[0]));
-      let cum = 0n;
-      let winner = null;
-      for (const [addr, amtStr] of entries) {
-        const amt = BigInt(amtStr);
-        if (rand >= cum && rand < cum + amt) {
-          winner = addr;
-          break;
+  try {
+    let currentHeight = await getState('currentHeight', 0);
+    let contributors = await getState('contributors', {});
+    let lastWinner = await getState('lastWinner', null);
+    const height = await getCurrentHeight();
+    if (height === null) return { success: false, error: 'Failed to get height' };
+    if (height > currentHeight && currentHeight > 0) {
+      console.log(`New block detected: ${height}. Triggering lottery for previous height ${height - 1}`);
+      const pot = Object.values(contributors).reduce((a, b) => a + BigInt(b), 0n);
+      if (pot > 0n) {
+        console.log(`Pot value: ${pot.toString()}`);
+        const prevHeight = height - 1;
+        let hash;
+        try {
+          const blockRes = await fetch(`${mempoolBase}/block-height/${prevHeight}`);
+          const responseText = await blockRes.text();
+          if (!blockRes.ok) throw new Error(`mempool.space failed: HTTP ${blockRes.status}, ${responseText}`);
+          hash = responseText.trim();
+          console.log(`Using block hash ${hash} for randomness`);
+        } catch (e) {
+          console.error(`mempool.space error: ${e.message}`);
+          return { success: false, error: `Block fetch error: ${e.message}` };
         }
-        cum += amt;
-      }
-      if (winner) {
-        console.log(`Winner selected: ${winner}`);
-        const success = await payoutTo(winner);
-        if (success) {
-          console.log(`Payout of ${pot.toString()} WISHY to ${winner} completed`);
-          contributors = {};
-          lastWinner = winner;
-          await setState('contributors', contributors);
-          await setState('lastWinner', lastWinner);
-          await setState('lastPayout', { winner, amount: pot.toString(), timestamp: Date.now() });
-          return { success: true, winner };
+        const rand = BigInt(`0x${hash}`) % pot;
+        const entries = Object.entries(contributors).sort((a, b) => a[0].localeCompare(b[0]));
+        let cum = 0n;
+        let winner = null;
+        for (const [addr, amtStr] of entries) {
+          const amt = BigInt(amtStr);
+          if (rand >= cum && rand < cum + amt) {
+            winner = addr;
+            break;
+          }
+          cum += amt;
+        }
+        if (winner) {
+          console.log(`Winner selected: ${winner}`);
+          const success = await payoutTo(winner);
+          if (success) {
+            console.log(`Payout of ${pot.toString()} WISHY to ${winner} completed`);
+            contributors = {};
+            lastWinner = winner;
+            await setState('contributors', contributors);
+            await setState('lastWinner', lastWinner);
+            await setState('lastPayout', { winner, amount: pot.toString(), timestamp: Date.now() });
+            return { success: true, winner };
+          } else {
+            return { success: false, error: 'Payout failed' };
+          }
         } else {
-          return { success: false, error: 'Payout failed' };
+          console.log('No winner selected (edge case)');
+          return { success: false, error: 'No winner' };
         }
       } else {
-        console.log('No winner selected (edge case)');
-        return { success: false, error: 'No winner' };
+        console.log('Pot is empty, no lottery');
+        return { success: true, message: 'Empty pot' };
       }
     } else {
-      console.log('Pot is empty, no lottery');
-      return { success: true, message: 'Empty pot' };
+      console.log(`No new block or initial height. Current: ${height}`);
     }
-  } else {
-    console.log(`No new block or initial height. Current: ${height}`);
+    currentHeight = height;
+    await setState('currentHeight', currentHeight);
+    return { success: true, message: 'No action' };
+  } catch (e) {
+    console.error('Check block error:', e);
+    return { success: false, error: e.message };
   }
-  currentHeight = height;
-  await setState('currentHeight', currentHeight);
-  return { success: true, message: 'No action' };
 }
 
 async function payoutTo(winnerAddress) {
@@ -425,7 +430,7 @@ async function payoutTo(winnerAddress) {
     const feeRes = await fetch(`${mempoolBase}/v1/fees/recommended`);
     if (!feeRes.ok) {
       const errorText = await feeRes.text();
-      console.error(`Fee fetch failed: HTTP ${feeRes.status}, ${errorText}`);
+      console.error(`Fee fetch failed: ${feeRes.status}, ${errorText}`);
       return false;
     }
     const fees = await feeRes.json();
@@ -558,56 +563,111 @@ async function getLastBlockTime() {
 }
 
 app.get('/init', async (req, res) => {
-  const result = await init();
-  res.json(result);
+  try {
+    console.log('Hit /init');
+    const result = await init();
+    res.json(result);
+  } catch (e) {
+    console.error('Init route error:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/poll', async (req, res) => {
-  const result = await pollActivity();
-  res.json(result);
+  try {
+    console.log('Hit /poll');
+    const result = await pollActivity();
+    res.json(result);
+  } catch (e) {
+    console.error('Poll route error:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/check', authAdmin, async (req, res) => {
-  const result = await checkBlock();
-  res.json(result);
+  try {
+    console.log('Hit /check');
+    const result = await checkBlock();
+    res.json(result);
+  } catch (e) {
+    console.error('Check route error:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/status', async (req, res) => {
-  const contributors = await getState('contributors', {});
-  const pendingContributors = await getState('pendingContributors', {});
-  const potRaw = Object.values(contributors).reduce((a, b) => a + BigInt(b), 0n);
-  const pendingPotRaw = Object.values(pendingContributors).reduce((a, b) => a + BigInt(b.amount), 0n);
-  const pot = (potRaw / (10n ** BigInt(decimals || 0))).toString();
-  const pendingPot = (pendingPotRaw / (10n ** BigInt(decimals || 0))).toString();
-  const contribStr = {};
-  for (const k in contributors) contribStr[k] = contributors[k];
-  const pendingStr = {};
-  for (const k in pendingContributors) pendingStr[k] = pendingContributors[k];
-  const lastWinner = await getState('lastWinner', null);
-  res.json({ address, pot, pendingPot, contributors: contribStr, pendingContributors: pendingStr, lastWinner });
+  try {
+    console.log('Hit /status');
+    const contributors = await getState('contributors', {});
+    const pendingContributors = await getState('pendingContributors', {});
+    const potRaw = Object.values(contributors).reduce((a, b) => a + BigInt(b), 0n);
+    const pendingPotRaw = Object.values(pendingContributors).reduce((a, b) => a + BigInt(b.amount), 0n);
+    const pot = (potRaw / (10n ** BigInt(decimals || 0))).toString();
+    const pendingPot = (pendingPotRaw / (10n ** BigInt(decimals || 0))).toString();
+    const contribStr = {};
+    for (const k in contributors) contribStr[k] = contributors[k];
+    const pendingStr = {};
+    for (const k in pendingContributors) pendingStr[k] = pendingContributors[k];
+    const lastWinner = await getState('lastWinner', null);
+    res.json({ address, pot, pendingPot, contributors: contribStr, pendingContributors: pendingStr, lastWinner });
+  } catch (e) {
+    console.error('Status route error:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/balance', async (req, res) => {
-  const result = await getBalance();
-  res.json(result);
+  try {
+    console.log('Hit /balance');
+    const result = await getBalance();
+    res.json(result);
+  } catch (e) {
+    console.error('Balance route error:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/reset', authAdmin, async (req, res) => {
-  await setState('contributors', {});
-  await setState('pendingContributors', {});
-  await setState('lastTxid', null);
-  console.log('Contributors, pending, and lastTxid reset manually');
-  res.json({ success: true, message: 'State reset' });
+  try {
+    console.log('Hit /reset');
+    await setState('contributors', {});
+    await setState('pendingContributors', {});
+    await setState('lastTxid', null);
+    console.log('Contributors, pending, and lastTxid reset manually');
+    res.json({ success: true, message: 'State reset' });
+  } catch (e) {
+    console.error('Reset route error:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/last-block-time', async (req, res) => {
-  const result = await getLastBlockTime();
-  res.json(result);
+  try {
+    console.log('Hit /last-block-time');
+    const result = await getLastBlockTime();
+    res.json(result);
+  } catch (e) {
+    console.error('Last block time route error:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Serve the frontend HTML at root
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+  console.log('Hit /');
+  res.sendFile(path.join(__dirname, '..', 'index.html'));
+});
+
+// 404 handler
+app.use((req, res, next) => {
+  console.log(`404: ${req.url}`);
+  res.status(404).json({ error: 'Not Found' });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error('Server error:', err.stack);
+  res.status(500).json({ error: 'Internal Server Error' });
 });
 
 app.listen(port, async () => {
