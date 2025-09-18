@@ -8,6 +8,7 @@ const ecc = require('tiny-secp256k1');
 const { BIP32Factory } = require('bip32');
 const { createClient } = require('@redis/client');
 const rateLimit = require('express-rate-limit');
+const path = require('path');
 
 bitcoin.initEccLib(ecc);
 const bip32 = BIP32Factory(ecc);
@@ -602,6 +603,11 @@ app.get('/reset', authAdmin, async (req, res) => {
 app.get('/last-block-time', async (req, res) => {
   const result = await getLastBlockTime();
   res.json(result);
+});
+
+// Serve the frontend HTML at root
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 app.listen(port, async () => {
