@@ -289,13 +289,13 @@ async function pollActivity() {
         if (actualBalance === 0n && pendingCheck.ok && (await pendingCheck.json()).length === 0) {
           console.log('No pending txs and balance 0, resetting contributors');
           contributors = {};
-        } else if (actualBalance > 0n && currentPot === 0n) {
-          console.log('Pot empty but balance exists, resetting lastTxid to re-poll');
-          lastTxid = null;
-          await setState('lastTxid', null);
-        }
-      }
-    }
+        if (actualBalance > 0n && currentPot === 0n) {
+  console.log('Pot empty but balance exists, syncing contributors to balance');
+  contributors[address] = actualBalance.toString();
+  await setState('contributors', contributors);
+  lastTxid = null;
+  await setState('lastTxid', null);
+}
 
     await setState('contributors', contributors);
     return { success: true, newContributions, newWithdrawals };
