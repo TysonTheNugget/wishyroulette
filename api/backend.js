@@ -26,7 +26,7 @@ app.use(limiter);
 
 // CORS configuration
 const corsOptions = {
-  origin: ['https://wishyroulette.onrender.com', 'http://localhost:10000'],
+  origin: ['https://wishyroulette.onrender.com', 'http://localhost:10000', 'http://localhost:3000'],
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
@@ -133,42 +133,25 @@ async function init() {
 async function pollMempool() {
   console.log(`Polling mempool for unconfirmed txs to ${address}`);
   try {
-    const res = await fetch(`${mempoolBase}/address/${address}/mempool`);
+    const res = await fetch(`${mempoolBase}/address/${address}/txs/mempool`);
     if (!res.ok) {
       console.error(`Mempool poll failed: HTTP ${res.status}`);
       return { success: false, error: await res.text(), pending: [] };
     }
-    const txids = await res.json();
+    const txs = await res.json();
     let pendingContributions = [];
-    for (const txid of txids) {
-      const txRes = await fetch(`${mempoolBase}/tx/${txid}`);
-      if (!txRes.ok) continue;
-      const txHex = await txRes.text();
-      const tx = bitcoin.Transaction.fromHex(txHex);
+    for (const tx of txs) {
+      const txid = tx.txid;
       let incomingAmount = 0n;
       let sender = null;
-      for (let i = 0; i < tx.outs.length; i++) {
-        const out = tx.outs[i];
-        if (out.script && bitcoin.address.fromOutputScript(out.script, network) === address) {
-          const runeRes = await fetch(`https://api.hiro.so/ordinals/v1/inscriptions?tx_id=${txid}`);
-          if (runeRes.ok) {
-            const runeData = await runeRes.json();
-            const runes = runeData.results?.filter(r => r.rune_name === runeName) || [];
-            if (runes.length > 0) {
-              incomingAmount = BigInt(runes[0].amount || 0);
-            }
-          }
+      for (const vout of tx.vout) {
+        if (vout.scriptpubkey_address === address && vout.rune) {
+          const rune = vout.rune.find(r => r.rune_name === runeName);
+          if (rune) incomingAmount += BigInt(rune.amount || 0);
         }
       }
       if (incomingAmount > 0n) {
-        for (const input of tx.ins) {
-          const inputRes = await fetch(`${mempoolBase}/tx/${Buffer.from(input.hash).reverse().toString('hex')}`);
-          if (inputRes.ok) {
-            const inputTx = await inputRes.json();
-            sender = inputTx.vin[0]?.prevout?.scriptPubKey?.address;
-            if (sender) break;
-          }
-        }
+        sender = tx.vin[0]?.prevout?.scriptpubkey_address;
         if (sender && sender !== address) {
           const alias = Buffer.from(sender + incomingAmount.toString()).toString('base64').slice(0, 6).toUpperCase();
           pendingContributions.push({ sender, amount: incomingAmount.toString(), txid, status: 'pending', alias });
@@ -260,7 +243,15 @@ async function pollActivity() {
       let totalPot = Object.values(contributors).reduce((a, b) => a + BigInt(b), 0n);
       totalPot += totalPotAdjustment;
       if (totalPot <= 0n) {
-        contributors = {};
+        console.log('Outgoing transfer detected, checking if payout...');
+        const lastPayout = await getState('lastPayout', null);
+        if (!lastPayout || lastPayout.amount !== (-totalPotAdjustment).toString()) {
+          console.log('Not a payout, preserving contributors');
+          // Don't reset contributors
+        } else {
+          contributors = {};
+          console.log('Payout confirmed, reset contributors');
+        }
       } else {
         const scale = totalPot / (totalPot - totalPotAdjustment);
         for (const sender in contributors) {
@@ -294,10 +285,14 @@ async function pollActivity() {
       const currentPot = Object.values(contributors).reduce((a, b) => a + BigInt(b), 0n);
       if (actualBalance !== currentPot) {
         console.log(`Balance mismatch: contributors pot=${currentPot}, actual=${actualBalance}. Logging, not resetting...`);
-        const pendingCheck = await fetch(`${mempoolBase}/address/${address}/mempool`);
+        const pendingCheck = await fetch(`${mempoolBase}/address/${address}/txs/mempool`);
         if (actualBalance === 0n && pendingCheck.ok && (await pendingCheck.json()).length === 0) {
           console.log('No pending txs and balance 0, resetting contributors');
           contributors = {};
+        } else if (actualBalance > 0n && currentPot === 0n) {
+          console.log('Pot empty but balance exists, resetting lastTxid to re-poll');
+          lastTxid = null;
+          await setState('lastTxid', null);
         }
       }
     }
