@@ -8,7 +8,6 @@ const ecc = require('tiny-secp256k1');
 const { BIP32Factory } = require('bip32');
 const { createClient } = require('@redis/client');
 const rateLimit = require('express-rate-limit');
-const path = require('path');
 
 bitcoin.initEccLib(ecc);
 const bip32 = BIP32Factory(ecc);
@@ -25,9 +24,9 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// CORS configuration
+// CORS: Allow Vercel origin
 const corsOptions = {
-  origin: ['https://wishyroulette.onrender.com', 'http://localhost:10000', 'http://localhost:3000'],
+  origin: ['https://ruletfront.vercel.app', 'https://wishyroulette.onrender.com', 'http://localhost:10000', 'http://localhost:3000'],
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
@@ -430,7 +429,7 @@ async function payoutTo(winnerAddress) {
     const feeRes = await fetch(`${mempoolBase}/v1/fees/recommended`);
     if (!feeRes.ok) {
       const errorText = await feeRes.text();
-      console.error(`Fee fetch failed: ${feeRes.status}, ${errorText}`);
+      console.error(`Fee fetch failed: HTTP ${feeRes.status}, ${errorText}`);
       return false;
     }
     const fees = await feeRes.json();
@@ -489,188 +488,4 @@ async function payoutTo(winnerAddress) {
     const tx = psbt.extractTransaction();
     const txHex = tx.toHex();
     console.log(`Built TX: ${txHex}`);
-    const broadRes = await fetch(`${mempoolBase}/tx`, { method: 'POST', body: txHex });
-    if (broadRes.ok) {
-      const txid = await broadRes.text();
-      console.log(`Broadcast successful: TXID ${txid}`);
-      return true;
-    } else {
-      const errorText = await broadRes.text();
-      console.error(`Broadcast failed: ${errorText}`);
-      return false;
-    }
-  } catch (e) {
-    console.error(`Payout error: ${e.message}`);
-    return false;
-  }
-}
-
-async function getBalance() {
-  console.log(`Fetching rune balance for address: ${address}`);
-  try {
-    let res = await fetch(`${baseUrl}/address/${address}/runes`, { headers });
-    if (!res.ok) {
-      console.warn(`Ordiscan failed: HTTP ${res.status}, trying Hiro...`);
-      res = await fetch(`https://api.hiro.so/ordinals/v1/addresses/${address}/runes-balances`);
-    }
-    if (!res.ok) {
-      const errorText = await res.text();
-      console.error(`Balance fetch failed: HTTP ${res.status}, ${errorText}`);
-      return { success: false, error: errorText };
-    }
-    const response = await res.json();
-    const data = response.data || response.results || [];
-    let balance = 0n;
-    for (const rune of data) {
-      if (rune.rune_name === runeName || rune.name === runeName) {
-        balance = BigInt(rune.amount || rune.balance);
-        break;
-      }
-    }
-    console.log(`Current rune balance: ${balance.toString()} WISHYWASHYMACHINE`);
-    return { success: true, balance: balance.toString() };
-  } catch (e) {
-    console.error(`Balance fetch error: ${e.message}`);
-    return { success: false, error: e.message };
-  }
-}
-
-function encodeVarint(n) {
-  const bytes = [];
-  if (n === 0n) return Buffer.from([0]);
-  while (n > 0n) {
-    let byte = Number(n & 127n);
-    n = n >> 7n;
-    if (n > 0n) byte |= 128;
-    bytes.push(byte);
-  }
-  return Buffer.from(bytes);
-}
-
-async function getLastBlockTime() {
-  try {
-    const hashRes = await fetch(`${mempoolBase}/blocks/tip/hash`);
-    if (!hashRes.ok) throw new Error('Failed to get tip hash');
-    const hash = await hashRes.text();
-    const blockRes = await fetch(`${mempoolBase}/block/${hash}`);
-    if (!blockRes.ok) throw new Error('Failed to get block');
-    const block = await blockRes.json();
-    return { success: true, timestamp: block.timestamp };
-  } catch (e) {
-    console.error('Get last block time error:', e);
-    return { success: false, error: e.message };
-  }
-}
-
-app.get('/init', async (req, res) => {
-  try {
-    console.log('Hit /init');
-    const result = await init();
-    res.json(result);
-  } catch (e) {
-    console.error('Init route error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/poll', async (req, res) => {
-  try {
-    console.log('Hit /poll');
-    const result = await pollActivity();
-    res.json(result);
-  } catch (e) {
-    console.error('Poll route error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/check', authAdmin, async (req, res) => {
-  try {
-    console.log('Hit /check');
-    const result = await checkBlock();
-    res.json(result);
-  } catch (e) {
-    console.error('Check route error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/status', async (req, res) => {
-  try {
-    console.log('Hit /status');
-    const contributors = await getState('contributors', {});
-    const pendingContributors = await getState('pendingContributors', {});
-    const potRaw = Object.values(contributors).reduce((a, b) => a + BigInt(b), 0n);
-    const pendingPotRaw = Object.values(pendingContributors).reduce((a, b) => a + BigInt(b.amount), 0n);
-    const pot = (potRaw / (10n ** BigInt(decimals || 0))).toString();
-    const pendingPot = (pendingPotRaw / (10n ** BigInt(decimals || 0))).toString();
-    const contribStr = {};
-    for (const k in contributors) contribStr[k] = contributors[k];
-    const pendingStr = {};
-    for (const k in pendingContributors) pendingStr[k] = pendingContributors[k];
-    const lastWinner = await getState('lastWinner', null);
-    res.json({ address, pot, pendingPot, contributors: contribStr, pendingContributors: pendingStr, lastWinner });
-  } catch (e) {
-    console.error('Status route error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/balance', async (req, res) => {
-  try {
-    console.log('Hit /balance');
-    const result = await getBalance();
-    res.json(result);
-  } catch (e) {
-    console.error('Balance route error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/reset', authAdmin, async (req, res) => {
-  try {
-    console.log('Hit /reset');
-    await setState('contributors', {});
-    await setState('pendingContributors', {});
-    await setState('lastTxid', null);
-    console.log('Contributors, pending, and lastTxid reset manually');
-    res.json({ success: true, message: 'State reset' });
-  } catch (e) {
-    console.error('Reset route error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/last-block-time', async (req, res) => {
-  try {
-    console.log('Hit /last-block-time');
-    const result = await getLastBlockTime();
-    res.json(result);
-  } catch (e) {
-    console.error('Last block time route error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Serve the frontend HTML at root
-app.get('/', (req, res) => {
-  console.log('Hit /');
-  res.sendFile(path.join(__dirname, '..', 'index.html'));
-});
-
-// 404 handler
-app.use((req, res, next) => {
-  console.log(`404: ${req.url}`);
-  res.status(404).json({ error: 'Not Found' });
-});
-
-// Error handler
-app.use((err, req, res, next) => {
-  console.error('Server error:', err.stack);
-  res.status(500).json({ error: 'Internal Server Error' });
-});
-
-app.listen(port, async () => {
-  await connectRedis();
-  console.log(`Server running on port ${port}. Network: ${networkType}`);
-});
+    const broadRes = await fetch(`${mempoolBase}/tx
