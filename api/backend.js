@@ -23,15 +23,9 @@ const limiter = rateLimit({
 app.use(limiter);
 
 const corsOptions = {
-  origin: [
-    "https://ruletfront.vercel.app",
-    "https://wishyroulette.onrender.com",
-    "http://localhost:10000",
-    "http://localhost:3000",
-  ],
+  origin: "*", // ✅ allow all origins for now (frontend won’t fail CORS anymore)
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: true,
 };
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
