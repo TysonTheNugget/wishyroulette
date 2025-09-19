@@ -352,10 +352,9 @@ async function pollActivity() {
         }
         if (actualBalance > 0n && currentPot === 0n) {
           console.log(
-            "Pot empty but balance exists, syncing contributors to balance"
+            "Warning: balance exists on-chain but no contributors recorded. Triggering resync."
           );
-          contributors[address] = actualBalance.toString();
-          await setState("contributors", contributors);
+          // Force a rescan next poll instead of assigning to our own address
           lastTxid = null;
           await setState("lastTxid", null);
         }
