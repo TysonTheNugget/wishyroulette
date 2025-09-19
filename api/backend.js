@@ -14,17 +14,14 @@ const bip32 = BIP32Factory(ecc);
 const app = express();
 const port = process.env.PORT || 10000;
 
-// Fix for Render: Trust proxy for X-Forwarded-For
 app.set('trust proxy', 1);
 
-// Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // 100 requests per IP
+  windowMs: 15 * 60 * 1000,
+  max: 100,
 });
 app.use(limiter);
 
-// CORS: Allow Vercel origin
 const corsOptions = {
   origin: [
     'https://ruletfront.vercel.app',
@@ -39,7 +36,6 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
-// Validate environment variables
 if (!process.env.MNEMONIC) {
   console.error('Error: MNEMONIC environment variable is not set');
   process.exit(1);
@@ -74,7 +70,6 @@ const runeName = 'WISHYWASHYMACHINE';
 let runeId = process.env.RUNE_ID || "865286:2249";
 let decimals = Number(process.env.RUNE_DECIMALS ?? 0);
 
-// Redis setup with SSL for Upstash
 const redisClient = createClient({
   url: process.env.REDIS_URL,
   socket: { tls: process.env.REDIS_URL.startsWith('rediss://') },
@@ -104,7 +99,6 @@ async function setState(key, value) {
   await redisClient.set(key, JSON.stringify(value));
 }
 
-// Auth middleware for admin
 function authAdmin(req, res, next) {
   if (req.query.api_key !== adminApiKey) {
     return res.status(401).json({ success: false, error: 'Unauthorized' });
@@ -151,15 +145,15 @@ async function pollMempool() {
       let incomingAmount = 0n;
       let sender = null;
       for (const vout of tx.vout) {
-        if (vout.scriptpubkey_address === address && vout.rune) {
-          const rune = vout.rune.find(r => r.rune_name === runeName);
+        if (vout.scriptpubkey_address === address && vout.runes) {
+          const rune = vout.runes.find(r => r.rune_name === runeName);
           if (rune) incomingAmount += BigInt(rune.amount || 0);
         }
       }
       if (incomingAmount > 0n) {
         sender = tx.vin[0]?.prevout?.scriptpubkey_address;
         if (sender && sender !== address) {
-          const alias = Buffer.from(sender + incomingAmount.toString()).toString('base64').slice(0, 6).toUpperCase();
+          const alias = Buffer.from(sender + txid).toString('base64').slice(0, 6).toUpperCase();
           pendingContributions.push({ sender, amount: incomingAmount.toString(), txid, status: 'pending', alias });
           console.log(`Pending contribution from ${sender}: ${incomingAmount} (txid: ${txid}, alias: ${alias})`);
         }
@@ -177,8 +171,8 @@ async function pollActivity() {
   try {
     let contributors = await getState('contributors', {});
     let lastTxid = await getState('lastTxid', null);
-    const pendingResult = await pollMempool();
     let pendingContributors = await getState('pendingContributors', {});
+    const pendingResult = await pollMempool();
     if (pendingResult.success) {
       for (const contrib of pendingResult.pending) {
         if (!pendingContributors[contrib.txid]) {
@@ -216,17 +210,7 @@ async function pollActivity() {
         }
       }
       if (incomingAmount > 0n) {
-        const inputAddresses = new Set(tx.inputs.map(i => i.address));
-        if (inputAddresses.size === 1) {
-          sender = [...inputAddresses][0];
-        } else {
-          for (const inp of tx.inputs) {
-            if (inp.rune === runeName) {
-              sender = inp.address;
-              break;
-            }
-          }
-        }
+        sender = tx.inputs.find(inp => inp.rune === runeName)?.address;
         if (sender && sender !== address) {
           contributors[sender] = (BigInt(contributors[sender] || 0) + incomingAmount).toString();
           newContributions++;
@@ -247,7 +231,6 @@ async function pollActivity() {
         const lastPayout = await getState('lastPayout', null);
         if (!lastPayout || lastPayout.amount !== (-totalPotAdjustment).toString()) {
           console.log('Not a payout, preserving contributors');
-          // Don't reset contributors
         } else {
           contributors = {};
           console.log('Payout confirmed, reset contributors');
@@ -265,8 +248,6 @@ async function pollActivity() {
       await setState('lastTxid', lastTxid);
       console.log(`Updated lastTxid to ${lastTxid}`);
     }
-    const totalPot = Object.values(contributors).reduce((a, b) => a + BigInt(b), 0n);
-    console.log(`Total pot: ${totalPot.toString()} WISHYWASHYMACHINE`);
     let updatedPending = { ...pendingContributors };
     for (const txid in pendingContributors) {
       if (data.some(tx => tx.txid === txid)) {
@@ -324,6 +305,7 @@ async function checkBlock() {
     let currentHeight = await getState('currentHeight', 0);
     let contributors = await getState('contributors', {});
     let lastWinner = await getState('lastWinner', null);
+    let gameHistory = await getState('gameHistory', []);
     const height = await getCurrentHeight();
     if (height === null) return { success: false, error: 'Failed to get height' };
     if (height > currentHeight && currentHeight > 0) {
@@ -360,11 +342,13 @@ async function checkBlock() {
           const success = await payoutTo(winner);
           if (success) {
             console.log(`Payout of ${pot.toString()} WISHY to ${winner} completed`);
+            gameHistory.unshift({ winner, amount: pot.toString(), timestamp: Date.now() });
             contributors = {};
             lastWinner = winner;
             await setState('contributors', contributors);
             await setState('lastWinner', lastWinner);
             await setState('lastPayout', { winner, amount: pot.toString(), timestamp: Date.now() });
+            await setState('gameHistory', gameHistory);
             return { success: true, winner };
           } else {
             return { success: false, error: 'Payout failed' };
@@ -535,6 +519,17 @@ async function getBalance() {
   }
 }
 
+async function getHistory() {
+  console.log('Fetching game history...');
+  try {
+    const gameHistory = await getState('gameHistory', []);
+    return { success: true, games: gameHistory };
+  } catch (e) {
+    console.error('History fetch error:', e);
+    return { success: false, error: e.message };
+  }
+}
+
 function encodeVarint(n) {
   const bytes = [];
   if (n === 0n) return Buffer.from([0]);
@@ -605,7 +600,7 @@ app.get('/status', async (req, res) => {
     const pot = (potRaw / (10n ** BigInt(decimals || 0))).toString();
     const pendingPot = (pendingPotRaw / (10n ** BigInt(decimals || 0))).toString();
     const contribStr = {};
-    for (const k in contributors) contribStr[k] = contributors[k];
+    for (const k in contributors) contribStr[k] = (BigInt(contributors[k]) / (10n ** BigInt(decimals || 0))).toString();
     const pendingStr = {};
     for (const k in pendingContributors) pendingStr[k] = pendingContributors[k];
     const lastWinner = await getState('lastWinner', null);
@@ -623,6 +618,17 @@ app.get('/balance', async (req, res) => {
     res.json(result);
   } catch (e) {
     console.error('Balance route error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/history', async (req, res) => {
+  try {
+    console.log('Hit /history');
+    const result = await getHistory();
+    res.json(result);
+  } catch (e) {
+    console.error('History route error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -652,13 +658,11 @@ app.get('/last-block-time', async (req, res) => {
   }
 });
 
-// 404 handler
 app.use((req, res, next) => {
   console.log(`404: ${req.url}`);
   res.status(404).json({ error: 'Not Found' });
 });
 
-// Error handler
 app.use((err, req, res, next) => {
   console.error('Server error:', err.stack);
   res.status(500).json({ error: 'Internal Server Error' });
