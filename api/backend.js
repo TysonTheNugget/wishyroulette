@@ -151,7 +151,16 @@ async function pollMempool() {
         }
       }
       if (incomingAmount > 0n) {
-        sender = tx.vin[0]?.prevout?.scriptpubkey_address;
+        // Check all inputs to find the sender with rune transfer
+        for (const vin of tx.vin) {
+          if (vin.prevout && vin.prevout.runes) {
+            const rune = vin.prevout.runes.find(r => r.rune_name === runeName);
+            if (rune && BigInt(rune.amount || 0) > 0n) {
+              sender = vin.prevout.scriptpubkey_address;
+              break;
+            }
+          }
+        }
         if (sender && sender !== address) {
           const alias = Buffer.from(sender + txid).toString('base64').slice(0, 6).toUpperCase();
           pendingContributions.push({ sender, amount: incomingAmount.toString(), txid, status: 'pending', alias });
@@ -210,11 +219,28 @@ async function pollActivity() {
         }
       }
       if (incomingAmount > 0n) {
-        sender = tx.inputs.find(inp => inp.rune === runeName)?.address;
+        // Find the sender by checking inputs with rune transfers
+        for (const inp of tx.inputs) {
+          const runeActivityRes = await fetch(`${baseUrl}/tx/${tx.txid}/runes-activity`, { headers });
+          if (runeActivityRes.ok) {
+            const runeActivity = await runeActivityRes.json();
+            const activity = runeActivity.data.find(a => a.rune === runeName && a.from_address !== address);
+            if (activity && activity.from_address) {
+              sender = activity.from_address;
+              break;
+            }
+          }
+        }
+        if (!sender) {
+          // Fallback: use the first input address if rune activity is unavailable
+          sender = tx.inputs.find(inp => inp.address !== address)?.address;
+        }
         if (sender && sender !== address) {
           contributors[sender] = (BigInt(contributors[sender] || 0) + incomingAmount).toString();
           newContributions++;
           console.log(`New contribution from ${sender}: ${incomingAmount.toString()}`);
+        } else {
+          console.log(`Skipping contribution for tx ${tx.txid}: no valid sender found`);
         }
       }
       if (outgoingAmount > 0n) {
@@ -602,7 +628,10 @@ app.get('/status', async (req, res) => {
     const contribStr = {};
     for (const k in contributors) contribStr[k] = (BigInt(contributors[k]) / (10n ** BigInt(decimals || 0))).toString();
     const pendingStr = {};
-    for (const k in pendingContributors) pendingStr[k] = pendingContributors[k];
+    for (const k in pendingContributors) pendingStr[k] = {
+      ...pendingContributors[k],
+      amount: (BigInt(pendingContributors[k].amount) / (10n ** BigInt(decimals || 0))).toString()
+    };
     const lastWinner = await getState('lastWinner', null);
     res.json({ address, pot, pendingPot, contributors: contribStr, pendingContributors: pendingStr, lastWinner });
   } catch (e) {
