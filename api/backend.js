@@ -252,7 +252,7 @@ async function pollActivity() {
         }
       }
       if (incomingAmount > 0n) {
-        // Find *all* senders who actually spent WISHY into this tx
+        // Find *all*ddd senders who actually spent WISHY into this tx
         const senders = tx.inputs
           .filter((inp) => inp.address && inp.address !== address)
           .map((inp) => inp.address);
