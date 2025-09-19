@@ -233,7 +233,7 @@ async function pollActivity() {
         }
         if (!sender) {
           // Fallback: use the first input address if rune activity is unavailable
-          sender = tx.inputs.find(inp => inp.address !== address)?.address;
+          sender = tx.inputs.find(inp => inp.address && inp.address !== address)?.address || null;
         }
         if (sender && sender !== address) {
           contributors[sender] = (BigInt(contributors[sender] || 0) + incomingAmount).toString();
