@@ -40,7 +40,7 @@ if (!process.env.REDIS_URL) {
 }
 
 const adminApiKey = process.env.API_KEY;
-const networkType = process.env.NETWORK || "testnet";
+const networkType = process.env.NETWORK || "testnet"; // Default to testnet for safety
 const network =
   networkType === "testnet"
     ? bitcoin.networks.testnet
@@ -49,12 +49,12 @@ const mempoolBase =
   networkType === "testnet"
     ? "https://mempool.space/testnet/api"
     : "https://mempool.space/api";
-const ordiscanApiKey =
-  process.env.ORDISCAN_API_KEY || "373a1e27-947f-4bd8-80c6-639a03014a16";
 const baseUrl =
   networkType === "testnet"
-    ? "https://api.unisat.io/v1"
-    : "https://api.ordiscan.com/v1";
+    ? "https://testnet-api.unisat.io/v1"
+    : "https://api.unisat.io/v1";
+const ordiscanApiKey =
+  process.env.ORDISCAN_API_KEY || "373a1e27-947f-4bd8-80c6-639a03014a16";
 const headers = { Authorization: `Bearer ${ordiscanApiKey}` };
 
 const mnemonic = process.env.MNEMONIC;
@@ -116,25 +116,47 @@ function authAdmin(req, res, next) {
 async function init() {
   console.log("Initializing rune info and scanning history...");
   try {
-    // Fetch rune info
-    const res = await fetch(`${baseUrl}/rune/${runeName}`, { headers });
-    const responseText = await res.text();
-    if (!res.ok) {
-      console.error(
-        `Init failed: HTTP ${res.status}, Response: ${responseText}`
-      );
-      return { success: false, error: responseText };
+    // Fetch rune info with retry
+    let runeFetchAttempts = 0;
+    const maxAttempts = 3;
+    let runeData = null;
+    while (runeFetchAttempts < maxAttempts) {
+      try {
+        const res = await fetch(`${baseUrl}/rune/${runeName}`, { headers });
+        const responseText = await res.text();
+        if (!res.ok) {
+          console.error(
+            `Rune fetch attempt ${runeFetchAttempts + 1} failed: HTTP ${res.status}, Response: ${responseText}`
+          );
+          runeFetchAttempts++;
+          if (runeFetchAttempts === maxAttempts) {
+            console.warn("Max rune fetch attempts reached, using defaults");
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          continue;
+        }
+        runeData = JSON.parse(responseText);
+        break;
+      } catch (e) {
+        console.error(`Rune fetch error on attempt ${runeFetchAttempts + 1}: ${e.message}`);
+        runeFetchAttempts++;
+        if (runeFetchAttempts === maxAttempts) {
+          console.warn("Max rune fetch attempts reached, using defaults");
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
     }
-    const data = JSON.parse(responseText);
-    if (data && typeof data.id === "string" && data.id.includes(":")) {
-      runeId = data.id;
+    if (runeData && typeof runeData.id === "string" && runeData.id.includes(":")) {
+      runeId = runeData.id;
     }
-    if (Number.isInteger(data?.decimals)) {
-      decimals = data.decimals;
+    if (Number.isInteger(runeData?.decimals)) {
+      decimals = runeData.decimals;
     }
     console.log(`Rune ID: ${runeId}, Decimals: ${decimals}`);
 
-    // Perform initial historical scan
+    // Perform historical scan
     await scanHistoricalTransactions();
 
     return { success: true, runeId, decimals };
@@ -158,17 +180,41 @@ async function scanHistoricalTransactions() {
       return;
     }
 
-    // Fetch all transactions
-    const res = await fetch(
-      `${baseUrl}/address/${address}/activity/runes?sort=oldest`,
-      { headers }
-    );
-    if (!res.ok) {
-      console.error(`Historical scan failed: HTTP ${res.status}`);
-      return;
+    // Fetch transaction history with retry
+    let txFetchAttempts = 0;
+    const maxAttempts = 3;
+    let data = [];
+    while (txFetchAttempts < maxAttempts) {
+      try {
+        const res = await fetch(
+          `${baseUrl}/address/${address}/activity/runes?sort=oldest`,
+          { headers }
+        );
+        if (!res.ok) {
+          console.error(`Tx history fetch attempt ${txFetchAttempts + 1} failed: HTTP ${res.status}`);
+          txFetchAttempts++;
+          if (txFetchAttempts === maxAttempts) {
+            console.warn("Max tx fetch attempts reached, trying mempool...");
+            data = await fetchMempoolHistory();
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          continue;
+        }
+        const response = await res.json();
+        data = response.data || [];
+        break;
+      } catch (e) {
+        console.error(`Tx history fetch error on attempt ${txFetchAttempts + 1}: ${e.message}`);
+        txFetchAttempts++;
+        if (txFetchAttempts === maxAttempts) {
+          console.warn("Max tx fetch attempts reached, trying mempool...");
+          data = await fetchMempoolHistory();
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
     }
-    const response = await res.json();
-    const data = response.data || [];
 
     for (const tx of data) {
       if (lastTxid && tx.txid === lastTxid) continue;
@@ -178,21 +224,19 @@ async function scanHistoricalTransactions() {
       let sender = null;
       let recipient = null;
 
-      // Process outputs
-      for (const out of tx.outputs) {
+      for (const out of tx.outputs || []) {
         if (out.address === address && out.rune === runeName) {
-          incomingAmount += BigInt(out.rune_amount);
+          incomingAmount += BigInt(out.rune_amount || 0);
         }
         if (out.rune === runeName && out.address !== address) {
-          outgoingAmount += BigInt(out.rune_amount);
+          outgoingAmount += BigInt(out.rune_amount || 0);
           recipient = out.address;
         }
       }
 
-      // Process inputs to find sender
       const senders = tx.inputs
-        .filter((inp) => inp.address && inp.address !== address && inp.rune === runeName)
-        .map((inp) => inp.address);
+        ?.filter((inp) => inp.address && inp.address !== address && inp.rune === runeName)
+        .map((inp) => inp.address) || [];
 
       if (incomingAmount > 0n && senders.length > 0) {
         for (const s of senders) {
@@ -237,6 +281,50 @@ async function scanHistoricalTransactions() {
     console.log("Historical scan completed");
   } catch (e) {
     console.error("Historical scan error:", e);
+  }
+}
+
+async function fetchMempoolHistory() {
+  console.log(`Fetching transaction history from mempool for ${address}`);
+  try {
+    const res = await fetch(`${mempoolBase}/address/${address}/txs`);
+    if (!res.ok) {
+      console.error(`Mempool history fetch failed: HTTP ${res.status}`);
+      return [];
+    }
+    const txs = await res.json();
+    const runeTxs = [];
+    for (const tx of txs) {
+      let hasRune = false;
+      let outputs = [];
+      let inputs = [];
+      for (const vout of tx.vout) {
+        if (vout.runes?.some((r) => r.rune_name === runeName)) {
+          hasRune = true;
+          outputs.push({
+            address: vout.scriptpubkey_address,
+            rune: runeName,
+            rune_amount: vout.runes.find((r) => r.rune_name === runeName)?.amount || 0,
+          });
+        }
+      }
+      for (const vin of tx.vin) {
+        if (vin.prevout?.runes?.some((r) => r.rune_name === runeName)) {
+          hasRune = true;
+          inputs.push({
+            address: vin.prevout.scriptpubkey_address,
+            rune: runeName,
+          });
+        }
+      }
+      if (hasRune) {
+        runeTxs.push({ txid: tx.txid, inputs, outputs, timestamp: tx.status.block_time });
+      }
+    }
+    return runeTxs;
+  } catch (e) {
+    console.error("Mempool history fetch error:", e);
+    return [];
   }
 }
 
@@ -320,99 +408,111 @@ async function pollActivity() {
       { headers }
     );
     if (!res.ok) {
-      console.error(`Poll failed: HTTP ${res.status}`);
-      return { success: false, error: await res.text() };
-    }
-    const response = await res.json();
-    const data = response.data || [];
-    let newContributions = 0;
-    let newWithdrawals = 0;
-
-    for (const tx of data) {
-      if (lastTxid && tx.txid === lastTxid) break;
-
-      let incomingAmount = 0n;
-      let outgoingAmount = 0n;
-      let sender = null;
-      let recipient = null;
-
-      for (const out of tx.outputs) {
-        if (out.address === address && out.rune === runeName) {
-          incomingAmount += BigInt(out.rune_amount);
-        }
-        if (out.rune === runeName && out.address !== address) {
-          outgoingAmount += BigInt(out.rune_amount);
-          recipient = out.address;
-        }
+      console.error(`Poll failed: HTTP ${res.status}, trying mempool...`);
+      const mempoolData = await fetchMempoolHistory();
+      if (mempoolData.length > 0) {
+        processTransactions(mempoolData, contributors, gameHistory, lastTxid, pendingContributors);
+      } else {
+        console.error("Mempool fallback also failed");
+        return { success: false, error: "Transaction fetch failed" };
       }
-
-      const senders = tx.inputs
-        .filter((inp) => inp.address && inp.address !== address && inp.rune === runeName)
-        .map((inp) => inp.address);
-
-      if (incomingAmount > 0n && senders.length > 0) {
-        for (const s of senders) {
-          contributors[s] = (
-            BigInt(contributors[s] || 0) + incomingAmount
-          ).toString();
-          newContributions++;
-          console.log(
-            `New contribution from ${s}: ${incomingAmount.toString()}`
-          );
-        }
-      }
-
-      if (outgoingAmount > 0n && recipient) {
-        console.log(
-          `Detected outgoing transfer of ${outgoingAmount} to ${recipient}`
-        );
-        gameHistory.unshift({
-          winner: recipient,
-          amount: outgoingAmount.toString(),
-          timestamp: tx.timestamp || Date.now(),
-          txid: tx.txid,
-        });
-        contributors = {};
-        await setState("lastWinner", recipient);
-        await setState("lastPayout", {
-          winner: recipient,
-          amount: outgoingAmount.toString(),
-          timestamp: tx.timestamp || Date.now(),
-        });
-        newWithdrawals++;
-      }
+    } else {
+      const response = await res.json();
+      const data = response.data || [];
+      processTransactions(data, contributors, gameHistory, lastTxid, pendingContributors);
     }
 
-    if (data.length > 0) {
-      lastTxid = data[0].txid;
-      await setState("lastTxid", lastTxid);
-      console.log(`Updated lastTxid to ${lastTxid}`);
-    }
-
-    let updatedPending = { ...pendingContributors };
-    for (const txid in pendingContributors) {
-      if (data.some((tx) => tx.txid === txid)) {
-        const pend = pendingContributors[txid];
-        contributors[pend.sender] = (
-          BigInt(contributors[pend.sender] || 0) + BigInt(pend.amount)
-        ).toString();
-        delete updatedPending[txid];
-      }
-    }
-    await setState("pendingContributors", updatedPending);
     await setState("contributors", contributors);
     await setState("gameHistory", gameHistory);
+    await setState("pendingContributors", pendingContributors);
 
     const balanceResult = await getBalance();
     if (balanceResult.success && BigInt(balanceResult.balance) > 0n) {
       console.log(`Balance exists (${balanceResult.balance}), open game detected`);
     }
 
-    return { success: true, newContributions, newWithdrawals };
+    return { success: true, newContributions: 0, newWithdrawals: 0 };
   } catch (e) {
     console.error("Poll activity error:", e);
     return { success: false, error: e.message };
   }
+}
+
+function processTransactions(data, contributors, gameHistory, lastTxid, pendingContributors) {
+  let newContributions = 0;
+  let newWithdrawals = 0;
+  for (const tx of data) {
+    if (lastTxid && tx.txid === lastTxid) continue;
+
+    let incomingAmount = 0n;
+    let outgoingAmount = 0n;
+    let sender = null;
+    let recipient = null;
+
+    for (const out of tx.outputs || []) {
+      if (out.address === address && out.rune === runeName) {
+        incomingAmount += BigInt(out.rune_amount || 0);
+      }
+      if (out.rune === runeName && out.address !== address) {
+        outgoingAmount += BigInt(out.rune_amount || 0);
+        recipient = out.address;
+      }
+    }
+
+    const senders = tx.inputs
+      ?.filter((inp) => inp.address && inp.address !== address && inp.rune === runeName)
+      .map((inp) => inp.address) || [];
+
+    if (incomingAmount > 0n && senders.length > 0) {
+      for (const s of senders) {
+        contributors[s] = (
+          BigInt(contributors[s] || 0) + incomingAmount
+        ).toString();
+        newContributions++;
+        console.log(
+          `New contribution from ${s}: ${incomingAmount.toString()}`
+        );
+      }
+    }
+
+    if (outgoingAmount > 0n && recipient) {
+      console.log(
+        `Detected outgoing transfer of ${outgoingAmount} to ${recipient}`
+      );
+      gameHistory.unshift({
+        winner: recipient,
+        amount: outgoingAmount.toString(),
+        timestamp: tx.timestamp || Date.now(),
+        txid: tx.txid,
+      });
+      contributors = {};
+      setState("lastWinner", recipient);
+      setState("lastPayout", {
+        winner: recipient,
+        amount: outgoingAmount.toString(),
+        timestamp: tx.timestamp || Date.now(),
+      });
+      newWithdrawals++;
+    }
+  }
+
+  if (data.length > 0) {
+    lastTxid = data[0].txid;
+    setState("lastTxid", lastTxid);
+    console.log(`Updated lastTxid to ${lastTxid}`);
+  }
+
+  let updatedPending = { ...pendingContributors };
+  for (const txid in pendingContributors) {
+    if (data.some((tx) => tx.txid === txid)) {
+      const pend = pendingContributors[txid];
+      contributors[pend.sender] = (
+        BigInt(contributors[pend.sender] || 0) + BigInt(pend.amount)
+      ).toString();
+      delete updatedPending[txid];
+    }
+  }
+  setState("pendingContributors", updatedPending);
 }
 
 async function getCurrentHeight() {
@@ -662,22 +762,18 @@ async function getBalance() {
   try {
     let res = await fetch(`${baseUrl}/address/${address}/runes`, { headers });
     if (!res.ok) {
-      console.warn(`Ordiscan failed: HTTP ${res.status}, trying Hiro...`);
-      res = await fetch(
-        `https://api.hiro.so/ordinals/v1/addresses/${address}/runes-balances`
-      );
-    }
-    if (!res.ok) {
-      const errorText = await res.text();
-      console.error(`Balance fetch failed: HTTP ${res.status}, ${errorText}`);
-      return { success: false, error: errorText };
+      console.warn(`Unisat failed: HTTP ${res.status}, trying mempool...`);
+      const mempoolBalance = await getMempoolBalance();
+      if (mempoolBalance.success) return mempoolBalance;
+      console.error(`Balance fetch failed: HTTP ${res.status}`);
+      return { success: false, error: `Unisat failed: HTTP ${res.status}` };
     }
     const response = await res.json();
-    const data = response.data || response.results || [];
+    const data = response.data || [];
     let balance = 0n;
     for (const rune of data) {
-      if (rune.rune_name === runeName || rune.name === runeName) {
-        balance = BigInt(rune.amount || rune.balance);
+      if (rune.rune_name === runeName) {
+        balance = BigInt(rune.amount || 0);
         break;
       }
     }
@@ -686,7 +782,33 @@ async function getBalance() {
     );
     return { success: true, balance: balance.toString() };
   } catch (e) {
-    console.error(`Balance fetch error: ${e.message}`);
+    console.error(`Balance fetch error: ${e.message}, trying mempool...`);
+    const mempoolBalance = await getMempoolBalance();
+    if (mempoolBalance.success) return mempoolBalance;
+    return { success: false, error: e.message };
+  }
+}
+
+async function getMempoolBalance() {
+  console.log(`Fetching balance from mempool for ${address}`);
+  try {
+    const res = await fetch(`${mempoolBase}/address/${address}/utxos`);
+    if (!res.ok) {
+      console.error(`Mempool balance fetch failed: HTTP ${res.status}`);
+      return { success: false, error: `Mempool failed: HTTP ${res.status}` };
+    }
+    const utxos = await res.json();
+    let balance = 0n;
+    for (const utxo of utxos) {
+      if (utxo.runes) {
+        const rune = utxo.runes.find((r) => r.rune_name === runeName);
+        if (rune) balance += BigInt(rune.amount || 0);
+      }
+    }
+    console.log(`Mempool balance: ${balance.toString()} WISHYWASHYMACHINE`);
+    return { success: true, balance: balance.toString() };
+  } catch (e) {
+    console.error(`Mempool balance fetch error: ${e.message}`);
     return { success: false, error: e.message };
   }
 }
@@ -789,7 +911,8 @@ app.get("/status", async (req, res) => {
       pendingStr[k] = {
         ...pendingContributors[k],
         amount: (
-          BigInt(pendingContributors[k].amount) / 10n ** BigInt(decimals || 0)
+          BigInt(pendingContributors[k].amount) /
+          10n ** BigInt(decimals || 0)
         ).toString(),
       };
     const lastWinner = await getState("lastWinner", null);
@@ -803,6 +926,7 @@ app.get("/status", async (req, res) => {
       pendingContributors: pendingStr,
       lastWinner,
       hasOpenGame,
+      balanceError: !balanceResult.success ? balanceResult.error : null,
     });
   } catch (e) {
     console.error("Status route error:", e);
@@ -870,6 +994,6 @@ app.use((err, req, res, next) => {
 
 app.listen(port, async () => {
   await connectRedis();
-  await init(); // Run init with historical scan on startup
+  await init();
   console.log(`Server running on port ${port}. Network: ${networkType}`);
 });
