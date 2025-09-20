@@ -23,7 +23,7 @@ const limiter = rateLimit({
 app.use(limiter);
 
 const corsOptions = {
-  origin: "*", // ✅ allow all origins for now (frontend won’t fail CORS anymore)
+  origin: "*",
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 };
@@ -114,8 +114,9 @@ function authAdmin(req, res, next) {
 }
 
 async function init() {
-  console.log("Initializing rune info...");
+  console.log("Initializing rune info and scanning history...");
   try {
+    // Fetch rune info
     const res = await fetch(`${baseUrl}/rune/${runeName}`, { headers });
     const responseText = await res.text();
     if (!res.ok) {
@@ -132,10 +133,110 @@ async function init() {
       decimals = data.decimals;
     }
     console.log(`Rune ID: ${runeId}, Decimals: ${decimals}`);
+
+    // Perform initial historical scan
+    await scanHistoricalTransactions();
+
     return { success: true, runeId, decimals };
   } catch (e) {
     console.error(`Init error: ${e.message}`);
     return { success: false, error: e.message };
+  }
+}
+
+async function scanHistoricalTransactions() {
+  console.log(`Scanning historical transactions for address: ${address}`);
+  try {
+    let contributors = await getState("contributors", {});
+    let gameHistory = await getState("gameHistory", []);
+    let lastTxid = await getState("lastTxid", null);
+    let scannedHeight = await getState("scannedHeight", 0);
+
+    const currentHeight = await getCurrentHeight();
+    if (currentHeight === null) {
+      console.error("Failed to get current height for scan");
+      return;
+    }
+
+    // Fetch all transactions
+    const res = await fetch(
+      `${baseUrl}/address/${address}/activity/runes?sort=oldest`,
+      { headers }
+    );
+    if (!res.ok) {
+      console.error(`Historical scan failed: HTTP ${res.status}`);
+      return;
+    }
+    const response = await res.json();
+    const data = response.data || [];
+
+    for (const tx of data) {
+      if (lastTxid && tx.txid === lastTxid) continue;
+
+      let incomingAmount = 0n;
+      let outgoingAmount = 0n;
+      let sender = null;
+      let recipient = null;
+
+      // Process outputs
+      for (const out of tx.outputs) {
+        if (out.address === address && out.rune === runeName) {
+          incomingAmount += BigInt(out.rune_amount);
+        }
+        if (out.rune === runeName && out.address !== address) {
+          outgoingAmount += BigInt(out.rune_amount);
+          recipient = out.address;
+        }
+      }
+
+      // Process inputs to find sender
+      const senders = tx.inputs
+        .filter((inp) => inp.address && inp.address !== address && inp.rune === runeName)
+        .map((inp) => inp.address);
+
+      if (incomingAmount > 0n && senders.length > 0) {
+        for (const s of senders) {
+          contributors[s] = (
+            BigInt(contributors[s] || 0) + incomingAmount
+          ).toString();
+          console.log(
+            `Historical contribution from ${s}: ${incomingAmount.toString()}`
+          );
+        }
+      }
+
+      if (outgoingAmount > 0n && recipient) {
+        console.log(
+          `Detected historical payout of ${outgoingAmount} to ${recipient}`
+        );
+        gameHistory.unshift({
+          winner: recipient,
+          amount: outgoingAmount.toString(),
+          timestamp: tx.timestamp || Date.now(),
+          txid: tx.txid,
+        });
+        contributors = {};
+        await setState("lastWinner", recipient);
+        await setState("lastPayout", {
+          winner: recipient,
+          amount: outgoingAmount.toString(),
+          timestamp: tx.timestamp || Date.now(),
+        });
+      }
+    }
+
+    if (data.length > 0) {
+      lastTxid = data[data.length - 1].txid;
+      await setState("lastTxid", lastTxid);
+      console.log(`Updated lastTxid to ${lastTxid}`);
+    }
+
+    await setState("contributors", contributors);
+    await setState("gameHistory", gameHistory);
+    await setState("scannedHeight", currentHeight);
+    console.log("Historical scan completed");
+  } catch (e) {
+    console.error("Historical scan error:", e);
   }
 }
 
@@ -160,7 +261,6 @@ async function pollMempool() {
         }
       }
       if (incomingAmount > 0n) {
-        // Check all inputs to find the sender with rune transfer
         for (const vin of tx.vin) {
           if (vin.prevout && vin.prevout.runes) {
             const rune = vin.prevout.runes.find(
@@ -203,6 +303,8 @@ async function pollActivity() {
     let contributors = await getState("contributors", {});
     let lastTxid = await getState("lastTxid", null);
     let pendingContributors = await getState("pendingContributors", {});
+    let gameHistory = await getState("gameHistory", []);
+
     const pendingResult = await pollMempool();
     if (pendingResult.success) {
       for (const contrib of pendingResult.pending) {
@@ -212,6 +314,7 @@ async function pollActivity() {
       }
       await setState("pendingContributors", pendingContributors);
     }
+
     const res = await fetch(
       `${baseUrl}/address/${address}/activity/runes?sort=newest`,
       { headers }
@@ -224,90 +327,68 @@ async function pollActivity() {
     const data = response.data || [];
     let newContributions = 0;
     let newWithdrawals = 0;
-    let totalPotAdjustment = 0n;
+
     for (const tx of data) {
       if (lastTxid && tx.txid === lastTxid) break;
+
       let incomingAmount = 0n;
       let outgoingAmount = 0n;
       let sender = null;
+      let recipient = null;
+
       for (const out of tx.outputs) {
         if (out.address === address && out.rune === runeName) {
           incomingAmount += BigInt(out.rune_amount);
         }
-      }
-      const isFromOurAddress = tx.inputs.some(
-        (inp) => inp.address === address && inp.rune === runeName
-      );
-      if (isFromOurAddress) {
-        for (const out of tx.outputs) {
-          if (out.rune === runeName && out.address !== address) {
-            outgoingAmount += BigInt(out.rune_amount);
-          }
+        if (out.rune === runeName && out.address !== address) {
+          outgoingAmount += BigInt(out.rune_amount);
+          recipient = out.address;
         }
       }
-      if (incomingAmount > 0n) {
-        // Find *all*ddd senders who actually spent WISHY into this tx
-        const senders = tx.inputs
-          .filter((inp) => inp.address && inp.address !== address)
-          .map((inp) => inp.address);
 
-        if (senders.length > 0) {
-          for (const s of senders) {
-            contributors[s] = (
-              BigInt(contributors[s] || 0) + incomingAmount
-            ).toString();
-            newContributions++;
-            console.log(
-              `New contribution from ${s}: ${incomingAmount.toString()}`
-            );
-          }
-        } else {
+      const senders = tx.inputs
+        .filter((inp) => inp.address && inp.address !== address && inp.rune === runeName)
+        .map((inp) => inp.address);
+
+      if (incomingAmount > 0n && senders.length > 0) {
+        for (const s of senders) {
+          contributors[s] = (
+            BigInt(contributors[s] || 0) + incomingAmount
+          ).toString();
+          newContributions++;
           console.log(
-            `Skipping contribution for tx ${tx.txid}: no valid sender found`
+            `New contribution from ${s}: ${incomingAmount.toString()}`
           );
         }
       }
-      if (outgoingAmount > 0n) {
-        totalPotAdjustment -= outgoingAmount;
-        newWithdrawals++;
+
+      if (outgoingAmount > 0n && recipient) {
         console.log(
-          `Detected outgoing transfer of ${outgoingAmount.toString()} WISHYWASHYMACHINE`
+          `Detected outgoing transfer of ${outgoingAmount} to ${recipient}`
         );
+        gameHistory.unshift({
+          winner: recipient,
+          amount: outgoingAmount.toString(),
+          timestamp: tx.timestamp || Date.now(),
+          txid: tx.txid,
+        });
+        contributors = {};
+        await setState("lastWinner", recipient);
+        await setState("lastPayout", {
+          winner: recipient,
+          amount: outgoingAmount.toString(),
+          timestamp: tx.timestamp || Date.now(),
+        });
+        newWithdrawals++;
       }
     }
-    if (totalPotAdjustment < 0n) {
-      let totalPot = Object.values(contributors).reduce(
-        (a, b) => a + BigInt(b),
-        0n
-      );
-      totalPot += totalPotAdjustment;
-      if (totalPot <= 0n) {
-        console.log("Outgoing transfer detected, checking if payout...");
-        const lastPayout = await getState("lastPayout", null);
-        if (
-          !lastPayout ||
-          lastPayout.amount !== (-totalPotAdjustment).toString()
-        ) {
-          console.log("Not a payout, preserving contributors");
-        } else {
-          contributors = {};
-          console.log("Payout confirmed, reset contributors");
-        }
-      } else {
-        const scale = totalPot / (totalPot - totalPotAdjustment);
-        for (const sender in contributors) {
-          contributors[sender] = BigInt(
-            Math.floor(Number(BigInt(contributors[sender])) * Number(scale))
-          ).toString();
-          if (BigInt(contributors[sender]) === 0n) delete contributors[sender];
-        }
-      }
-    }
+
     if (data.length > 0) {
       lastTxid = data[0].txid;
       await setState("lastTxid", lastTxid);
       console.log(`Updated lastTxid to ${lastTxid}`);
     }
+
     let updatedPending = { ...pendingContributors };
     for (const txid in pendingContributors) {
       if (data.some((tx) => tx.txid === txid)) {
@@ -319,39 +400,14 @@ async function pollActivity() {
       }
     }
     await setState("pendingContributors", updatedPending);
-    const balanceResult = await getBalance();
-    if (balanceResult.success) {
-      const actualBalance = BigInt(balanceResult.balance);
-      const currentPot = Object.values(contributors).reduce(
-        (a, b) => a + BigInt(b),
-        0n
-      );
-      if (actualBalance !== currentPot) {
-        console.log(
-          `Balance mismatch: contributors pot=${currentPot}, actual=${actualBalance}. Logging, not resetting...`
-        );
-        const pendingCheck = await fetch(
-          `${mempoolBase}/address/${address}/txs/mempool`
-        );
-        if (
-          actualBalance === 0n &&
-          pendingCheck.ok &&
-          (await pendingCheck.json()).length === 0
-        ) {
-          console.log("No pending txs and balance 0, resetting contributors");
-          contributors = {};
-        }
-        if (actualBalance > 0n && currentPot === 0n) {
-          console.log(
-            "Warning: balance exists on-chain but no contributors recorded. Triggering resync."
-          );
-          // Force a rescan next poll instead of assigning to our own address
-          lastTxid = null;
-          await setState("lastTxid", null);
-        }
-      }
-    }
     await setState("contributors", contributors);
+    await setState("gameHistory", gameHistory);
+
+    const balanceResult = await getBalance();
+    if (balanceResult.success && BigInt(balanceResult.balance) > 0n) {
+      console.log(`Balance exists (${balanceResult.balance}), open game detected`);
+    }
+
     return { success: true, newContributions, newWithdrawals };
   } catch (e) {
     console.error("Poll activity error:", e);
@@ -385,9 +441,7 @@ async function checkBlock() {
       return { success: false, error: "Failed to get height" };
     if (height > currentHeight && currentHeight > 0) {
       console.log(
-        `New block detected: ${height}. Triggering lottery for previous height ${
-          height - 1
-        }`
+        `New block detected: ${height}. Triggering lottery for previous height ${height - 1}`
       );
       const pot = Object.values(contributors).reduce(
         (a, b) => a + BigInt(b),
@@ -437,6 +491,7 @@ async function checkBlock() {
               winner,
               amount: pot.toString(),
               timestamp: Date.now(),
+              txid: null,
             });
             contributors = {};
             lastWinner = winner;
@@ -460,8 +515,6 @@ async function checkBlock() {
         console.log("Pot is empty, no lottery");
         return { success: true, message: "Empty pot" };
       }
-    } else {
-      console.log(`No new block or initial height. Current: ${height}`);
     }
     currentHeight = height;
     await setState("currentHeight", currentHeight);
@@ -560,7 +613,7 @@ async function payoutTo(winnerAddress) {
     const [blockStr, txStr] = runeId.split(":");
     const deltaBlock = BigInt(blockStr);
     const deltaTx = BigInt(txStr);
-    const amount = 0n;
+    const amount = runeAmount;
     const payload = Buffer.concat([
       encodeVarint(0n),
       encodeVarint(deltaBlock),
@@ -724,25 +777,24 @@ app.get("/status", async (req, res) => {
     );
     const pot = (potRaw / 10n ** BigInt(decimals || 0)).toString();
     const pendingPot = (
-      pendingPotRaw /
-      10n ** BigInt(decimals || 0)
+      pendingPotRaw / 10n ** BigInt(decimals || 0)
     ).toString();
     const contribStr = {};
     for (const k in contributors)
       contribStr[k] = (
-        BigInt(contributors[k]) /
-        10n ** BigInt(decimals || 0)
+        BigInt(contributors[k]) / 10n ** BigInt(decimals || 0)
       ).toString();
     const pendingStr = {};
     for (const k in pendingContributors)
       pendingStr[k] = {
         ...pendingContributors[k],
         amount: (
-          BigInt(pendingContributors[k].amount) /
-          10n ** BigInt(decimals || 0)
+          BigInt(pendingContributors[k].amount) / 10n ** BigInt(decimals || 0)
         ).toString(),
       };
     const lastWinner = await getState("lastWinner", null);
+    const balanceResult = await getBalance();
+    const hasOpenGame = balanceResult.success && BigInt(balanceResult.balance) > 0n;
     res.json({
       address,
       pot,
@@ -750,6 +802,7 @@ app.get("/status", async (req, res) => {
       contributors: contribStr,
       pendingContributors: pendingStr,
       lastWinner,
+      hasOpenGame,
     });
   } catch (e) {
     console.error("Status route error:", e);
@@ -785,7 +838,8 @@ app.get("/reset", authAdmin, async (req, res) => {
     await setState("contributors", {});
     await setState("pendingContributors", {});
     await setState("lastTxid", null);
-    console.log("Contributors, pending, and lastTxid reset manually");
+    await setState("scannedHeight", 0);
+    console.log("Contributors, pending, lastTxid, and scannedHeight reset manually");
     res.json({ success: true, message: "State reset" });
   } catch (e) {
     console.error("Reset route error:", e);
@@ -816,5 +870,6 @@ app.use((err, req, res, next) => {
 
 app.listen(port, async () => {
   await connectRedis();
+  await init(); // Run init with historical scan on startup
   console.log(`Server running on port ${port}. Network: ${networkType}`);
 });
