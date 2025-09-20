@@ -40,15 +40,13 @@ if (!process.env.REDIS_URL) {
 }
 
 const adminApiKey = process.env.API_KEY;
-const networkType = "mainnet"; // Fixed to mainnet only
+const networkType = "mainnet";
 const network = bitcoin.networks.bitcoin;
 const mempoolBase = "https://mempool.space/api";
-const unisatBaseUrl = "https://open-api.unisat.io/v1/indexer";
-const ordiscanBaseUrl = "https://api.ordiscan.com/v1";
-const unisatApiKey = process.env.UNISAT_API_KEY || ""; // Get from unisat.io/plans
-const ordiscanApiKey = process.env.ORDISCAN_API_KEY || "373a1e27-947f-4bd8-80c6-639a03014a16";
-const unisatHeaders = unisatApiKey ? { Authorization: `Bearer ${unisatApiKey}` } : {};
-const ordiscanHeaders = { Authorization: `Bearer ${ordiscanApiKey}` };
+const ordiscanApiKey =
+  process.env.ORDISCAN_API_KEY || "373a1e27-947f-4bd8-80c6-639a03014a16";
+const baseUrl = "https://api.ordiscan.com/v1";
+const headers = { Authorization: `Bearer ${ordiscanApiKey}` };
 
 const mnemonic = process.env.MNEMONIC;
 let seed;
@@ -66,8 +64,8 @@ const { address } = bitcoin.payments.p2wpkh({
   network,
 });
 
-const runeName = process.env.RUNE_NAME || "WISHYWASHYMACHINE";
-let runeId = process.env.RUNE_ID || "865286:2249"; // Update if known
+const runeName = "WISHYWASHYMACHINE";
+let runeId = process.env.RUNE_ID || "865286:2249";
 let decimals = Number(process.env.RUNE_DECIMALS ?? 0);
 
 const redisClient = createClient({
@@ -106,66 +104,25 @@ function authAdmin(req, res, next) {
   next();
 }
 
-async function fetchWithRetry(url, options = {}, maxAttempts = 3) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const res = await fetch(url, options);
-      if (res.ok) return res;
-      const text = await res.text();
-      console.error(`Fetch attempt ${attempt} failed for ${url}: HTTP ${res.status} - ${text}`);
-      if (attempt === maxAttempts) throw new Error(`Failed after ${maxAttempts} attempts: ${text}`);
-      await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
-    } catch (e) {
-      console.error(`Fetch error on attempt ${attempt} for ${url}: ${e.message}`);
-      if (attempt === maxAttempts) throw e;
-      await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
-    }
-  }
-}
-
 async function init() {
-  console.log("Initializing rune info and scanning history on mainnet...");
+  console.log("Initializing rune info...");
   try {
-    // Load cached rune info
-    const cachedRune = await getState("runeInfo", null);
-    if (cachedRune) {
-      runeId = cachedRune.runeId;
-      decimals = cachedRune.decimals;
-      console.log(`Using cached rune info: ID ${runeId}, Decimals ${decimals}`);
+    const res = await fetch(`${baseUrl}/rune/${runeName}`, { headers });
+    const responseText = await res.text();
+    if (!res.ok) {
+      console.error(
+        `Init failed: HTTP ${res.status}, Response: ${responseText}`
+      );
+      return { success: false, error: responseText };
     }
-
-    // Fetch rune info from UniSat
-    let runeData = null;
-    try {
-      const res = await fetchWithRetry(`${unisatBaseUrl}/runes/${runeName}`);
-      const data = await res.json();
-      if (data.code === 0 && data.data) {
-        runeData = data.data;
-        runeId = runeData.id || runeId;
-        decimals = runeData.divisibility || decimals;
-        console.log(`Fetched rune info: ID ${runeId}, Decimals ${decimals}`);
-      } else {
-        console.warn(`UniSat rune fetch failed, trying Ordiscan...`);
-        const ordRes = await fetchWithRetry(`${ordiscanBaseUrl}/rune/${runeName}`, { headers: ordiscanHeaders });
-        const ordData = await ordRes.json();
-        if (ordData.code === 0 && ordData.data) {
-          runeData = ordData.data;
-          runeId = runeData.id;
-          decimals = runeData.divisibility || 0;
-          console.log(`Ordiscan rune info: ID ${runeId}, Decimals ${decimals}`);
-        }
-      }
-    } catch (e) {
-      console.error(`Rune fetch error: ${e.message}. Using defaults/cached.`);
+    const data = JSON.parse(responseText);
+    if (data && typeof data.id === "string" && data.id.includes(":")) {
+      runeId = data.id;
     }
-
-    if (runeData) {
-      await setState("runeInfo", { runeId, decimals });
+    if (Number.isInteger(data?.decimals)) {
+      decimals = data.decimals;
     }
-
-    // Perform historical scan
-    await scanHistoricalTransactions();
-
+    console.log(`Rune ID: ${runeId}, Decimals: ${decimals}`);
     return { success: true, runeId, decimals };
   } catch (e) {
     console.error(`Init error: ${e.message}`);
@@ -173,109 +130,32 @@ async function init() {
   }
 }
 
-async function scanHistoricalTransactions() {
-  console.log(`Scanning historical transactions for address: ${address} on mainnet`);
-  try {
-    let contributors = await getState("contributors", {});
-    let gameHistory = await getState("gameHistory", []);
-    let lastTxid = await getState("lastTxid", null);
-
-    // Fetch from Ordiscan (reliable for runes activity)
-    let data = [];
-    try {
-      const res = await fetchWithRetry(`${ordiscanBaseUrl}/address/${address}/activity/runes?sort=oldest`, { headers: ordiscanHeaders });
-      const response = await res.json();
-      data = response.data || [];
-      console.log(`Fetched ${data.length} historical txs from Ordiscan`);
-    } catch (e) {
-      console.error(`Ordiscan history fetch failed: ${e.message}, trying UniSat...`);
-      const uniRes = await fetchWithRetry(`${unisatBaseUrl}/address/${address}/runes/history`);
-      const uniData = await uniRes.json();
-      data = uniData.data || [];
-    }
-
-    for (const tx of data) {
-      if (lastTxid && tx.txid === lastTxid) continue;
-
-      let incomingAmount = 0n;
-      let outgoingAmount = 0n;
-      let recipient = null;
-
-      // Process outputs
-      for (const out of (tx.outputs || [])) {
-        if (out.address === address && out.rune === runeName) {
-          incomingAmount += BigInt(out.amount || 0);
-        }
-        if (out.rune === runeName && out.address !== address) {
-          outgoingAmount += BigInt(out.amount || 0);
-          recipient = out.address;
-        }
-      }
-
-      // Find senders from inputs
-      const senders = (tx.inputs || [])
-        .filter((inp) => inp.address && inp.address !== address && inp.rune === runeName)
-        .map((inp) => inp.address);
-
-      if (incomingAmount > 0n && senders.length > 0) {
-        for (const s of senders) {
-          contributors[s] = (BigInt(contributors[s] || 0) + incomingAmount).toString();
-          console.log(`Historical contribution from ${s.slice(0, 8)}...: ${incomingAmount.toString()}`);
-        }
-      }
-
-      if (outgoingAmount > 0n && recipient) {
-        console.log(`Detected historical payout of ${outgoingAmount} to ${recipient.slice(0, 8)}...`);
-        gameHistory.unshift({
-          winner: recipient,
-          amount: outgoingAmount.toString(),
-          timestamp: tx.timestamp || Date.now(),
-          txid: tx.txid,
-        });
-        contributors = {}; // Reset for new game
-        await setState("lastWinner", recipient);
-        await setState("lastPayout", {
-          winner: recipient,
-          amount: outgoingAmount.toString(),
-          timestamp: tx.timestamp || Date.now(),
-        });
-      }
-    }
-
-    if (data.length > 0) {
-      lastTxid = data[data.length - 1].txid;
-      await setState("lastTxid", lastTxid);
-    }
-
-    await setState("contributors", contributors);
-    await setState("gameHistory", gameHistory);
-    console.log("Historical scan completed");
-  } catch (e) {
-    console.error("Historical scan error:", e);
-  }
-}
-
 async function pollMempool() {
   console.log(`Polling mempool for unconfirmed txs to ${address}`);
   try {
     const res = await fetch(`${mempoolBase}/address/${address}/txs/mempool`);
-    if (!res.ok) return { success: false, error: await res.text(), pending: [] };
+    if (!res.ok) {
+      console.error(`Mempool poll failed: HTTP ${res.status}`);
+      return { success: false, error: await res.text(), pending: [] };
+    }
     const txs = await res.json();
     let pendingContributions = [];
     for (const tx of txs) {
       const txid = tx.txid;
       let incomingAmount = 0n;
       let sender = null;
-      for (const vout of (tx.vout || [])) {
+      for (const vout of tx.vout) {
         if (vout.scriptpubkey_address === address && vout.runes) {
-          const rune = vout.runes.find((r) => r.name === runeName);
+          const rune = vout.runes.find((r) => r.rune_name === runeName);
           if (rune) incomingAmount += BigInt(rune.amount || 0);
         }
       }
       if (incomingAmount > 0n) {
-        for (const vin of (tx.vin || [])) {
+        for (const vin of tx.vin) {
           if (vin.prevout && vin.prevout.runes) {
-            const rune = vin.prevout.runes.find((r) => r.name === runeName);
+            const rune = vin.prevout.runes.find(
+              (r) => r.rune_name === runeName
+            );
             if (rune && BigInt(rune.amount || 0) > 0n) {
               sender = vin.prevout.scriptpubkey_address;
               break;
@@ -283,9 +163,20 @@ async function pollMempool() {
           }
         }
         if (sender && sender !== address) {
-          const alias = Buffer.from(sender + txid).toString("base64").slice(0, 6).toUpperCase();
-          pendingContributions.push({ sender, amount: incomingAmount.toString(), txid, status: "pending", alias });
-          console.log(`Pending from ${sender.slice(0, 8)}...: ${incomingAmount.toString()}`);
+          const alias = Buffer.from(sender + txid)
+            .toString("base64")
+            .slice(0, 6)
+            .toUpperCase();
+          pendingContributions.push({
+            sender,
+            amount: incomingAmount.toString(),
+            txid,
+            status: "pending",
+            alias,
+          });
+          console.log(
+            `Pending contribution from ${sender}: ${incomingAmount} (txid: ${txid}, alias: ${alias})`
+          );
         }
       }
     }
@@ -302,87 +193,154 @@ async function pollActivity() {
     let contributors = await getState("contributors", {});
     let lastTxid = await getState("lastTxid", null);
     let pendingContributors = await getState("pendingContributors", {});
-    let gameHistory = await getState("gameHistory", []);
-
     const pendingResult = await pollMempool();
     if (pendingResult.success) {
       for (const contrib of pendingResult.pending) {
-        if (!pendingContributors[contrib.txid]) pendingContributors[contrib.txid] = contrib;
+        if (!pendingContributors[contrib.txid]) {
+          pendingContributors[contrib.txid] = contrib;
+        }
       }
       await setState("pendingContributors", pendingContributors);
     }
-
-    // Fetch recent activity from Ordiscan
-    const res = await fetchWithRetry(`${ordiscanBaseUrl}/address/${address}/activity/runes?sort=newest`, { headers: ordiscanHeaders });
+    const res = await fetch(
+      `${baseUrl}/address/${address}/activity/runes?sort=newest`,
+      { headers }
+    );
+    if (!res.ok) {
+      console.error(`Poll failed: HTTP ${res.status}`);
+      return { success: false, error: await res.text() };
+    }
     const response = await res.json();
     const data = response.data || [];
-
     let newContributions = 0;
     let newWithdrawals = 0;
+    let totalPotAdjustment = 0n;
     for (const tx of data) {
       if (lastTxid && tx.txid === lastTxid) break;
-
       let incomingAmount = 0n;
       let outgoingAmount = 0n;
-      let recipient = null;
-
-      for (const out of (tx.outputs || [])) {
-        if (out.address === address && out.rune === runeName) incomingAmount += BigInt(out.amount || 0);
-        if (out.rune === runeName && out.address !== address) {
-          outgoingAmount += BigInt(out.amount || 0);
-          recipient = out.address;
+      let sender = null;
+      for (const out of tx.outputs) {
+        if (out.address === address && out.rune === runeName) {
+          incomingAmount += BigInt(out.rune_amount);
         }
       }
-
-      const senders = (tx.inputs || [])
-        .filter((inp) => inp.address && inp.address !== address && inp.rune === runeName)
-        .map((inp) => inp.address);
-
-      if (incomingAmount > 0n && senders.length > 0) {
-        for (const s of senders) {
-          contributors[s] = (BigInt(contributors[s] || 0) + incomingAmount).toString();
+      const isFromOurAddress = tx.inputs.some(
+        (inp) => inp.address === address && inp.rune === runeName
+      );
+      if (isFromOurAddress) {
+        for (const out of tx.outputs) {
+          if (out.rune === runeName && out.address !== address) {
+            outgoingAmount += BigInt(out.rune_amount);
+          }
+        }
+      }
+      if (incomingAmount > 0n) {
+        // Find sender
+        for (const inp of tx.inputs) {
+          if (inp.address && inp.address !== address) {
+            sender = inp.address;
+            break;
+          }
+        }
+        if (sender) {
+          contributors[sender] = (
+            BigInt(contributors[sender] || 0) + incomingAmount
+          ).toString();
           newContributions++;
-          console.log(`New contribution from ${s.slice(0, 8)}...: ${incomingAmount.toString()}`);
+          console.log(
+            `New contribution from ${sender}: ${incomingAmount.toString()}`
+          );
+        } else {
+          console.log(
+            `Skipping contribution for tx ${tx.txid}: no valid sender found`
+          );
         }
       }
-
-      if (outgoingAmount > 0n && recipient) {
-        console.log(`Outgoing transfer of ${outgoingAmount} to ${recipient.slice(0, 8)}...`);
-        gameHistory.unshift({
-          winner: recipient,
-          amount: outgoingAmount.toString(),
-          timestamp: tx.timestamp || Date.now(),
-          txid: tx.txid,
-        });
-        contributors = {};
-        await setState("lastWinner", recipient);
-        await setState("lastPayout", { winner: recipient, amount: outgoingAmount.toString(), timestamp: tx.timestamp || Date.now() });
+      if (outgoingAmount > 0n) {
+        totalPotAdjustment -= outgoingAmount;
         newWithdrawals++;
+        console.log(
+          `Detected outgoing transfer of ${outgoingAmount.toString()} WISHYWASHYMACHINE`
+        );
       }
     }
-
+    if (totalPotAdjustment < 0n) {
+      let totalPot = Object.values(contributors).reduce(
+        (a, b) => a + BigInt(b),
+        0n
+      );
+      totalPot += totalPotAdjustment;
+      if (totalPot <= 0n) {
+        console.log("Outgoing transfer detected, checking if payout...");
+        const lastPayout = await getState("lastPayout", null);
+        if (
+          !lastPayout ||
+          lastPayout.amount !== (-totalPotAdjustment).toString()
+        ) {
+          console.log("Not a payout, preserving contributors");
+        } else {
+          contributors = {};
+          console.log("Payout confirmed, reset contributors");
+        }
+      } else {
+        const scale = totalPot / (totalPot - totalPotAdjustment);
+        for (const sender in contributors) {
+          contributors[sender] = BigInt(
+            Math.floor(Number(BigInt(contributors[sender])) * Number(scale))
+          ).toString();
+          if (BigInt(contributors[sender]) === 0n) delete contributors[sender];
+        }
+      }
+    }
     if (data.length > 0) {
       lastTxid = data[0].txid;
       await setState("lastTxid", lastTxid);
+      console.log(`Updated lastTxid to ${lastTxid}`);
     }
-
     let updatedPending = { ...pendingContributors };
     for (const txid in pendingContributors) {
       if (data.some((tx) => tx.txid === txid)) {
         const pend = pendingContributors[txid];
-        contributors[pend.sender] = (BigInt(contributors[pend.sender] || 0) + BigInt(pend.amount)).toString();
+        contributors[pend.sender] = (
+          BigInt(contributors[pend.sender] || 0) + BigInt(pend.amount)
+        ).toString();
         delete updatedPending[txid];
       }
     }
     await setState("pendingContributors", updatedPending);
-    await setState("contributors", contributors);
-    await setState("gameHistory", gameHistory);
-
     const balanceResult = await getBalance();
-    if (balanceResult.success && BigInt(balanceResult.balance) > 0n) {
-      console.log(`Open game detected: balance ${balanceResult.balance}`);
+    if (balanceResult.success) {
+      const actualBalance = BigInt(balanceResult.balance);
+      const currentPot = Object.values(contributors).reduce(
+        (a, b) => a + BigInt(b),
+        0n
+      );
+      if (actualBalance !== currentPot) {
+        console.log(
+          `Balance mismatch: contributors pot=${currentPot}, actual=${actualBalance}. Logging, not resetting...`
+        );
+        const pendingCheck = await fetch(
+          `${mempoolBase}/address/${address}/txs/mempool`
+        );
+        if (
+          actualBalance === 0n &&
+          pendingCheck.ok &&
+          (await pendingCheck.json()).length === 0
+        ) {
+          console.log("No pending txs and balance 0, resetting contributors");
+          contributors = {};
+        }
+        if (actualBalance > 0n && currentPot === 0n) {
+          console.log(
+            "Warning: balance exists on-chain but no contributors recorded. Triggering resync."
+          );
+          lastTxid = null;
+          await setState("lastTxid", null);
+        }
+      }
     }
-
+    await setState("contributors", contributors);
     return { success: true, newContributions, newWithdrawals };
   } catch (e) {
     console.error("Poll activity error:", e);
@@ -391,10 +349,16 @@ async function pollActivity() {
 }
 
 async function getCurrentHeight() {
+  console.log("Fetching current block height...");
   try {
     const res = await fetch(`${mempoolBase}/blocks/tip/height`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return Number(await res.text());
+    if (!res.ok) {
+      console.error(`Mempool height failed: HTTP ${res.status}`);
+      return null;
+    }
+    const height = Number(await res.text());
+    console.log(`Current height: ${height}`);
+    return height;
   } catch (e) {
     console.error("Get height error:", e);
     return null;
@@ -402,57 +366,98 @@ async function getCurrentHeight() {
 }
 
 async function checkBlock() {
-  console.log("Checking for new block on mainnet...");
+  console.log("Checking for new block...");
   try {
     let currentHeight = await getState("currentHeight", 0);
     let contributors = await getState("contributors", {});
+    let lastWinner = await getState("lastWinner", null);
+    let gameHistory = await getState("gameHistory", []);
     const height = await getCurrentHeight();
-    if (height === null || height <= currentHeight) {
-      await setState("currentHeight", height || currentHeight);
-      return { success: true, message: "No new block" };
+    if (height === null) {
+      return { success: false, error: "Failed to get height" };
     }
-
-    console.log(`New block ${height}, checking lottery...`);
-    const pot = Object.values(contributors).reduce((a, b) => a + BigInt(b), 0n);
-    if (pot <= 0n) {
-      await setState("currentHeight", height);
-      return { success: true, message: "Empty pot" };
-    }
-
-    const prevHeight = height - 1;
-    const blockRes = await fetch(`${mempoolBase}/block-height/${prevHeight}`);
-    if (!blockRes.ok) throw new Error(`Block fetch failed: ${await blockRes.text()}`);
-    const hash = (await blockRes.text()).trim();
-    const rand = BigInt(`0x${hash}`) % pot;
-
-    const entries = Object.entries(contributors).sort((a, b) => a[0].localeCompare(b[0]));
-    let cum = 0n;
-    let winner = null;
-    for (const [addr, amtStr] of entries) {
-      const amt = BigInt(amtStr);
-      if (rand >= cum && rand < cum + amt) {
-        winner = addr;
-        break;
+    if (height > currentHeight && currentHeight > 0) {
+      console.log(
+        `New block detected: ${height}. Triggering lottery for previous height ${height - 1}`
+      );
+      const pot = Object.values(contributors).reduce(
+        (a, b) => a + BigInt(b),
+        0n
+      );
+      if (pot > 0n) {
+        console.log(`Pot value: ${pot.toString()}`);
+        const prevHeight = height - 1;
+        let hash;
+        try {
+          const blockRes = await fetch(
+            `${mempoolBase}/block-height/${prevHeight}`
+          );
+          const responseText = await blockRes.text();
+          if (!blockRes.ok) {
+            throw new Error(
+              `mempool.space failed: HTTP ${blockRes.status}, ${responseText}`
+            );
+          }
+          hash = responseText.trim();
+          console.log(`Using block hash ${hash} for randomness`);
+        } catch (e) {
+          console.error(`mempool.space error: ${e.message}`);
+          return { success: false, error: `Block fetch error: ${e.message}` };
+        }
+        const rand = BigInt(`0x${hash}`) % pot;
+        const entries = Object.entries(contributors).sort((a, b) =>
+          a[0].localeCompare(b[0])
+        );
+        let cum = 0n;
+        let winner = null;
+        for (const [addr, amtStr] of entries) {
+          const amt = BigInt(amtStr);
+          if (rand >= cum && rand < cum + amt) {
+            winner = addr;
+            break;
+          }
+          cum += amt;
+        }
+        if (winner) {
+          console.log(`Winner selected: ${winner}`);
+          const success = await payoutTo(winner);
+          if (success) {
+            console.log(
+              `Payout of ${pot.toString()} WISHY to ${winner} completed`
+            );
+            gameHistory.unshift({
+              winner,
+              amount: pot.toString(),
+              timestamp: Date.now(),
+            });
+            contributors = {};
+            lastWinner = winner;
+            await setState("contributors", contributors);
+            await setState("lastWinner", lastWinner);
+            await setState("lastPayout", {
+              winner,
+              amount: pot.toString(),
+              timestamp: Date.now(),
+            });
+            await setState("gameHistory", gameHistory);
+            return { success: true, winner };
+          } else {
+            return { success: false, error: "Payout failed" };
+          }
+        } else {
+          console.log("No winner selected (edge case)");
+          return { success: false, error: "No winner" };
+        }
+      } else {
+        console.log("Pot is empty, no lottery");
+        return { success: true, message: "Empty pot" };
       }
-      cum += amt;
+    } else {
+      console.log(`No new block or initial height. Current: ${height}`);
     }
-
-    if (winner) {
-      console.log(`Winner: ${winner.slice(0, 8)}...`);
-      const success = await payoutTo(winner);
-      if (success) {
-        const gameHistory = await getState("gameHistory", []);
-        gameHistory.unshift({ winner, amount: pot.toString(), timestamp: Date.now(), txid: null });
-        await setState("gameHistory", gameHistory);
-        await setState("contributors", {});
-        await setState("lastWinner", winner);
-        await setState("currentHeight", height);
-        return { success: true, winner };
-      }
-    }
-
-    await setState("currentHeight", height);
-    return { success: false, error: "No winner or payout failed" };
+    currentHeight = height;
+    await setState("currentHeight", currentHeight);
+    return { success: true, message: "No action" };
   } catch (e) {
     console.error("Check block error:", e);
     return { success: false, error: e.message };
@@ -460,86 +465,127 @@ async function checkBlock() {
 }
 
 async function payoutTo(winnerAddress) {
-  console.log(`Payout to ${winnerAddress.slice(0, 8)}... on mainnet`);
+  console.log(`Attempting payout to ${winnerAddress}`);
+  if (!runeId || !runeId.includes(":")) {
+    console.error(`Payout aborted: runeId invalid (${runeId})`);
+    return false;
+  }
   try {
-    const utxoRes = await fetchWithRetry(`${unisatBaseUrl}/address/${address}/utxo-data`, { headers: unisatHeaders });
-    const utxoData = await utxoRes.json();
-    const utxos = utxoData.data || [];
-    if (utxos.length === 0) return false;
-
+    const utxoRes = await fetch(`${baseUrl}/address/${address}/utxos`, {
+      headers,
+    });
+    if (!utxoRes.ok) {
+      console.error(`UTXO fetch failed: HTTP ${utxoRes.status}`);
+      return false;
+    }
+    const utxoResponse = await utxoRes.json();
+    const utxos = utxoResponse.data || [];
+    if (utxos.length === 0) {
+      console.log("No UTXOs");
+      return false;
+    }
     let totalSats = 0n;
     let hasRune = false;
     let runeAmount = 0n;
-    for (const u of utxos) {
+    utxos.forEach((u) => {
       totalSats += BigInt(u.value);
       if (u.runes) {
-        const rune = u.runes.find(r => r.name === runeName);
-        if (rune) {
-          hasRune = true;
-          runeAmount += BigInt(rune.amount);
-        }
+        u.runes.forEach((r) => {
+          if (r.name === runeName) {
+            hasRune = true;
+            runeAmount += BigInt(r.amount);
+          }
+        });
       }
+    });
+    console.log(
+      `Total sats: ${totalSats}, Has rune: ${hasRune}, Rune amount: ${runeAmount.toString()}`
+    );
+    if (!hasRune) {
+      console.log("No runes found in UTXOs");
+      return false;
     }
-    if (!hasRune || runeAmount === 0n) return false;
-
     const feeRes = await fetch(`${mempoolBase}/v1/fees/recommended`);
+    if (!feeRes.ok) {
+      console.error(`Fee fetch failed: HTTP ${feeRes.status}`);
+      return false;
+    }
     const fees = await feeRes.json();
     const feeRate = fees.economyFee;
+    console.log(`Using fee rate: ${feeRate} sat/vB`);
     const txSize = 10 + utxos.length * 68 + 34 * 3 + 20;
     let fee = BigInt(feeRate * txSize);
     const dust = 546n;
     let change = totalSats - dust - fee;
-    if (change < 0n) return false;
-
+    if (change < 0n) {
+      console.log("Insufficient sats for fee");
+      return false;
+    }
     const psbt = new bitcoin.Psbt({ network });
-    const p2wpkh = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(child.publicKey), network });
-
+    const p2wpkh = bitcoin.payments.p2wpkh({
+      pubkey: Buffer.from(child.publicKey),
+      network,
+    });
     for (const u of utxos) {
-      const [h, idxStr] = u.tx_hash + ":" + u.index;
-      const script = Buffer.from(u.scriptpubkey, "hex");
+      if (!u.outpoint) {
+        console.error(`Invalid UTXO: ${JSON.stringify(u)}`);
+        continue;
+      }
+      const [h, idxStr] = u.outpoint.split(":");
+      const script = u.script_pubkey
+        ? Buffer.from(u.script_pubkey, "hex")
+        : p2wpkh.output;
       psbt.addInput({
-        hash: h.split(":")[0],
-        index: Number(idxStr.split(":")[1]),
+        hash: h,
+        index: Number(idxStr),
         witnessUtxo: { value: Number(BigInt(u.value)), script },
       });
     }
-
     psbt.addOutput({ address: winnerAddress, value: Number(dust) });
     let outputIndex = 0;
     if (change >= dust) {
       psbt.addOutput({ address, value: Number(change) });
       outputIndex = 1;
     }
-
     const [blockStr, txStr] = runeId.split(":");
     const deltaBlock = BigInt(blockStr);
     const deltaTx = BigInt(txStr);
+    const amount = runeAmount;
     const payload = Buffer.concat([
       encodeVarint(0n),
       encodeVarint(deltaBlock),
       encodeVarint(deltaTx),
-      encodeVarint(runeAmount),
+      encodeVarint(amount),
       encodeVarint(BigInt(outputIndex)),
     ]);
-    const opReturnScript = bitcoin.script.compile([bitcoin.opcodes.OP_RETURN, bitcoin.opcodes.OP_13, payload]);
+    const opReturnScript = bitcoin.script.compile([
+      bitcoin.opcodes.OP_RETURN,
+      bitcoin.opcodes.OP_13,
+      payload,
+    ]);
     psbt.addOutput({ script: opReturnScript, value: 0 });
-
     const signer = {
       publicKey: Buffer.from(child.publicKey),
       sign: (hash) => Buffer.from(child.sign(hash)),
     };
-    for (let i = 0; i < utxos.length; i++) psbt.signInput(i, signer);
+    for (let i = 0; i < utxos.length; i++) {
+      psbt.signInput(i, signer);
+    }
     psbt.finalizeAllInputs();
     const tx = psbt.extractTransaction();
     const txHex = tx.toHex();
-
-    const broadRes = await fetch(`${mempoolBase}/tx`, { method: "POST", body: txHex });
+    console.log(`Built TX: ${txHex}`);
+    const broadRes = await fetch(`${mempoolBase}/tx`, {
+      method: "POST",
+      body: txHex,
+    });
     if (broadRes.ok) {
       const txid = await broadRes.text();
-      console.log(`Payout broadcast: TXID ${txid}`);
+      console.log(`Broadcast successful: TXID ${txid}`);
       return true;
     } else {
-      console.error(`Broadcast failed: ${await broadRes.text()}`);
+      const errorText = await broadRes.text();
+      console.error(`Broadcast failed: ${errorText}`);
       return false;
     }
   } catch (e) {
@@ -549,45 +595,39 @@ async function payoutTo(winnerAddress) {
 }
 
 async function getBalance() {
-  console.log(`Fetching rune balance for ${address}`);
+  console.log(`Fetching rune balance for address: ${address}`);
   try {
-    // UniSat specific rune balance
-    const res = await fetchWithRetry(`${unisatBaseUrl}/address/${address}/runes/${runeId}/balance`, { headers: unisatHeaders });
-    if (res.ok) {
-      const data = await res.json();
-      if (data.code === 0 && data.data) {
-        const balance = BigInt(data.data.balance || 0);
-        console.log(`UniSat balance: ${balance.toString()}`);
-        return { success: true, balance: balance.toString() };
+    const res = await fetch(`${baseUrl}/address/${address}/runes`, { headers });
+    if (!res.ok) {
+      console.error(`Balance fetch failed: HTTP ${res.status}`);
+      return { success: false, error: await res.text() };
+    }
+    const response = await res.json();
+    const data = response.data || [];
+    let balance = 0n;
+    for (const rune of data) {
+      if (rune.rune_name === runeName) {
+        balance = BigInt(rune.amount || 0);
+        break;
       }
     }
-
-    // Fallback to Ordiscan
-    console.warn("UniSat balance failed, trying Ordiscan...");
-    const ordRes = await fetchWithRetry(`${ordiscanBaseUrl}/address/${address}/runes`, { headers: ordiscanHeaders });
-    const ordData = await ordRes.json();
-    if (ordData.code === 0) {
-      for (const rune of (ordData.data || [])) {
-        if (rune.name === runeName) {
-          const balance = BigInt(rune.balance || 0);
-          console.log(`Ordiscan balance: ${balance.toString()}`);
-          return { success: true, balance: balance.toString() };
-        }
-      }
-    }
-
-    return { success: false, error: "All balance APIs failed" };
+    console.log(
+      `Current rune balance: ${balance.toString()} WISHYWASHYMACHINE`
+    );
+    return { success: true, balance: balance.toString() };
   } catch (e) {
-    console.error(`Balance error: ${e.message}`);
+    console.error(`Balance fetch error: ${e.message}`);
     return { success: false, error: e.message };
   }
 }
 
 async function getHistory() {
+  console.log("Fetching game history...");
   try {
     const gameHistory = await getState("gameHistory", []);
     return { success: true, games: gameHistory };
   } catch (e) {
+    console.error("History fetch error:", e);
     return { success: false, error: e.message };
   }
 }
@@ -597,7 +637,7 @@ function encodeVarint(n) {
   if (n === 0n) return Buffer.from([0]);
   while (n > 0n) {
     let byte = Number(n & 127n);
-    n >>= 7n;
+    n = n >> 7n;
     if (n > 0n) byte |= 128;
     bytes.push(byte);
   }
@@ -607,45 +647,81 @@ function encodeVarint(n) {
 async function getLastBlockTime() {
   try {
     const hashRes = await fetch(`${mempoolBase}/blocks/tip/hash`);
+    if (!hashRes.ok) throw new Error("Failed to get tip hash");
     const hash = await hashRes.text();
     const blockRes = await fetch(`${mempoolBase}/block/${hash}`);
+    if (!blockRes.ok) throw new Error("Failed to get block");
     const block = await blockRes.json();
     return { success: true, timestamp: block.timestamp };
   } catch (e) {
+    console.error("Get last block time error:", e);
     return { success: false, error: e.message };
   }
 }
 
-// Routes
 app.get("/init", async (req, res) => {
-  const result = await init();
-  res.json(result);
+  try {
+    console.log("Hit /init");
+    const result = await init();
+    res.json(result);
+  } catch (e) {
+    console.error("Init route error:", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get("/poll", async (req, res) => {
-  const result = await pollActivity();
-  res.json(result);
+  try {
+    console.log("Hit /poll");
+    const result = await pollActivity();
+    res.json(result);
+  } catch (e) {
+    console.error("Poll route error:", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get("/check", authAdmin, async (req, res) => {
-  const result = await checkBlock();
-  res.json(result);
+  try {
+    console.log("Hit /check");
+    const result = await checkBlock();
+    res.json(result);
+  } catch (e) {
+    console.error("Check route error:", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get("/status", async (req, res) => {
   try {
+    console.log("Hit /status");
     const contributors = await getState("contributors", {});
     const pendingContributors = await getState("pendingContributors", {});
-    const potRaw = Object.values(contributors).reduce((a, b) => a + BigInt(b), 0n);
-    const pendingPotRaw = Object.values(pendingContributors).reduce((a, b) => a + BigInt(b.amount), 0n);
-    const pot = (potRaw / (10n ** BigInt(decimals))).toString();
-    const pendingPot = (pendingPotRaw / (10n ** BigInt(decimals))).toString();
+    const potRaw = Object.values(contributors).reduce(
+      (a, b) => a + BigInt(b),
+      0n
+    );
+    const pendingPotRaw = Object.values(pendingContributors).reduce(
+      (a, b) => a + BigInt(b.amount),
+      0n
+    );
+    const pot = (potRaw / 10n ** BigInt(decimals || 0)).toString();
+    const pendingPot = (
+      pendingPotRaw / 10n ** BigInt(decimals || 0)
+    ).toString();
     const contribStr = {};
-    for (const k in contributors) contribStr[k] = (BigInt(contributors[k]) / (10n ** BigInt(decimals))).toString();
+    for (const k in contributors)
+      contribStr[k] = (
+        BigInt(contributors[k]) / 10n ** BigInt(decimals || 0)
+      ).toString();
     const pendingStr = {};
-    for (const k in pendingContributors) {
-      pendingStr[k] = { ...pendingContributors[k], amount: (BigInt(pendingContributors[k].amount) / (10n ** BigInt(decimals))).toString() };
-    }
+    for (const k in pendingContributors)
+      pendingStr[k] = {
+        ...pendingContributors[k],
+        amount: (
+          BigInt(pendingContributors[k].amount) / 10n ** BigInt(decimals || 0)
+        ).toString(),
+      };
     const lastWinner = await getState("lastWinner", null);
     const balanceResult = await getBalance();
     const hasOpenGame = balanceResult.success && BigInt(balanceResult.balance) > 0n;
@@ -657,29 +733,71 @@ app.get("/status", async (req, res) => {
       pendingContributors: pendingStr,
       lastWinner,
       hasOpenGame,
-      balanceError: balanceResult.success ? null : balanceResult.error,
     });
   } catch (e) {
+    console.error("Status route error:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
-app.get("/balance", async (req, res) => await res.json(await getBalance()));
-
-app.get("/history", async (req, res) => await res.json(await getHistory()));
-
-app.get("/reset", authAdmin, async (req, res) => {
-  await setState("contributors", {});
-  await setState("pendingContributors", {});
-  await setState("lastTxid", null);
-  await setState("scannedHeight", 0);
-  res.json({ success: true, message: "Reset" });
+app.get("/balance", async (req, res) => {
+  try {
+    console.log("Hit /balance");
+    const result = await getBalance();
+    res.json(result);
+  } catch (e) {
+    console.error("Balance route error:", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.get("/last-block-time", async (req, res) => await res.json(await getLastBlockTime()));
+app.get("/history", async (req, res) => {
+  try {
+    console.log("Hit /history");
+    const result = await getHistory();
+    res.json(result);
+  } catch (e) {
+    console.error("History route error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/reset", authAdmin, async (req, res) => {
+  try {
+    console.log("Hit /reset");
+    await setState("contributors", {});
+    await setState("pendingContributors", {});
+    await setState("lastTxid", null);
+    console.log("Contributors, pending, and lastTxid reset manually");
+    res.json({ success: true, message: "State reset" });
+  } catch (e) {
+    console.error("Reset route error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/last-block-time", async (req, res) => {
+  try {
+    console.log("Hit /last-block-time");
+    const result = await getLastBlockTime();
+    res.json(result);
+  } catch (e) {
+    console.error("Last block time route error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.use((req, res, next) => {
+  console.log(`404: ${req.url}`);
+  res.status(404).json({ error: "Not Found" });
+});
+
+app.use((err, req, res, next) => {
+  console.error("Server error:", err.stack);
+  res.status(500).json({ error: "Internal Server Error" });
+});
 
 app.listen(port, async () => {
   await connectRedis();
-  await init();
-  console.log(`Mainnet server on port ${port}`);
+  console.log(`Server running on port ${port}. Network: ${networkType}`);
 });
